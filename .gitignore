@@ -1,0 +1,5 @@
+.env
+.garmin_tokens/
+garmin_daily_cache.json
+history.csv
+activity.xlsx
