@@ -6,12 +6,17 @@ month, days, weight, rhr, hr_max, bb_max, VO2max, max_VO2max, stress,
 calories, moderate, intense, total (= moderate + 2 * intense).
 
 Installation :
-    pip install garminconnect pandas openpyxl
+    pip install garminconnect pandas openpyxl python-dotenv
+  ou avec uv :
+    uv run --with garminconnect --with pandas --with openpyxl --with python-dotenv garmin_history.py
 
-Identifiants (jamais écrits dans le code ni sur disque) :
-    export GARMIN_EMAIL="votre@email"
-    export GARMIN_PASSWORD="votre_mot_de_passe"
-  Sinon le script les demande au clavier (mot de passe masqué).
+Identifiants (jamais écrits dans le code) :
+  1. Fichier .env à côté du script (voir .env.example) :
+         GARMIN_EMAIL=votre@email
+         GARMIN_PASSWORD=votre_mot_de_passe
+  2. ou variables d'environnement (export GARMIN_EMAIL=...)
+  3. sinon le script les demande au clavier (mot de passe masqué).
+  Les variables déjà définies dans l'environnement priment sur le .env.
 
 Usage :
     python garmin_history.py --start 2020-08-01
@@ -28,25 +33,48 @@ from pathlib import Path
 import pandas as pd
 from garminconnect import Garmin
 
+try:
+    from dotenv import load_dotenv
+    # .env à côté du script, quel que soit le dossier d'où on lance la commande
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    print("(python-dotenv non installé : le fichier .env est ignoré)")
+
 TOKEN_DIR = Path.home() / ".garmin_tokens"   # jetons de session (pas le mot de passe)
 CACHE_FILE = Path("garmin_daily_cache.json")  # données journalières déjà téléchargées
 
 
 def login() -> Garmin:
-    email = os.environ.get("GARMIN_EMAIL") or input("Email Garmin : ")
-    # 1) essai avec les jetons enregistrés
+    TOKEN_DIR.mkdir(exist_ok=True, mode=0o700)
+
+    # 1) essai avec les jetons enregistrés (aucun appel de connexion => pas de 429)
     try:
         api = Garmin()
         api.login(str(TOKEN_DIR))
         return api
     except Exception:
         pass
-    # 2) connexion classique
+
+    # 2) connexion avec identifiants
+    email = os.environ.get("GARMIN_EMAIL") or input("Email Garmin : ")
     password = os.environ.get("GARMIN_PASSWORD") or getpass.getpass("Mot de passe Garmin : ")
     api = Garmin(email, password, prompt_mfa=lambda: input("Code MFA : "))
-    api.login()
-    TOKEN_DIR.mkdir(exist_ok=True, mode=0o700)
-    api.garth.dump(str(TOKEN_DIR))
+    try:
+        try:
+            api.login(str(TOKEN_DIR))   # versions récentes : sauvegarde les jetons ici
+        except TypeError:
+            api.login()                  # anciennes versions
+    except Exception as e:
+        if "429" in str(e) or "TooMany" in type(e).__name__:
+            raise SystemExit(
+                "Garmin bloque temporairement la connexion (erreur 429).\n"
+                "Ne relancez pas en boucle : attendez 1 à 2 heures (parfois 24 h), "
+                "ou essayez depuis un autre réseau (partage de connexion du téléphone)."
+            )
+        raise
+    # anciennes versions uniquement (garth) : sauvegarde des jetons
+    if hasattr(api, "garth"):
+        api.garth.dump(str(TOKEN_DIR))
     return api
 
 
