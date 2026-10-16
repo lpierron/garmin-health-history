@@ -111,7 +111,7 @@ def fetch_day(api: Garmin, d: str) -> dict:
 def download(api: Garmin, start: date, end: date) -> dict:
     cache = json.loads(CACHE_FILE.read_text()) if CACHE_FILE.exists() else {}
     d, n = start, 0
-    while d <= end:
+    while d < end:
         key = d.isoformat()
         # on retélécharge toujours les 3 derniers jours (données incomplètes)
         if key not in cache or d >= end - timedelta(days=3):
