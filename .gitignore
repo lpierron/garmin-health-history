@@ -3,3 +3,7 @@
 garmin_daily_cache.json
 history.csv
 activity.xlsx
+*.png
+*.csv
+__pycache__/
+*.pyc
