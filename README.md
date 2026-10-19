@@ -1,4 +1,7 @@
-# Garmin History
+# Garmin Health History
+
+[![CI](https://github.com/lpierron/garmin-health-history/actions/workflows/ci.yml/badge.svg)](https://github.com/lpierron/garmin-health-history/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Download your [Garmin Connect](https://connect.garmin.com/) activity history and
 produce a monthly summary as CSV and Excel.
