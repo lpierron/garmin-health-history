@@ -136,7 +136,7 @@ def monthly(cache: dict) -> pd.DataFrame:
         "weight": g["weight"].mean(),
         "rhr": g["rhr"].mean(),
         "hr_max": g["hr_max"].max(),
-        "bb_max": g["bb_max"].max(),
+        "bb_max": g["bb_max"].mean(),
         "VO2max": g["VO2max"].mean(),
         "max_VO2max": g["VO2max"].max(),
         "stress": g["stress"].mean(),
