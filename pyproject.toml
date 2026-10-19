@@ -7,6 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "garminconnect>=0.3.17",
     "matplotlib>=3.11.2",
+    "numpy>=2.3.0",
     "openpyxl>=3.1.5",
     "pandas>=3.0.6",
     "python-dotenv>=1.2.4",
