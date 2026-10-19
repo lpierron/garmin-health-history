@@ -11,7 +11,7 @@ then explore the relationship between activity and health indicators (see
 ## Requirements
 
 - Python >= 3.13
-- Dependencies: `garminconnect`, `pandas`, `openpyxl`, plus `scipy` and
+- Dependencies: `garminconnect`, `pandas`, `openpyxl`, `tqdm`, plus `scipy` and
   `matplotlib` for the analysis scripts
 
 ## Installation
@@ -25,7 +25,7 @@ uv sync
 Or with pip:
 
 ```sh
-pip install garminconnect pandas openpyxl scipy matplotlib
+pip install garminconnect pandas openpyxl scipy matplotlib tqdm
 ```
 
 ## Credentials
@@ -75,6 +75,8 @@ where `total = moderate + 2 * intense`.
 - Daily data is cached in `garmin_daily_cache.json`; already-fetched days are not
   downloaded again. The last 3 days are always refreshed since their data may be
   incomplete.
+- A progress bar tracks the download; it is hidden automatically when the output
+  is not a terminal.
 - A short delay between requests is applied to be gentle on Garmin's servers.
 
 The generated files (`history.csv`, `activity.xlsx`), the cache, and session

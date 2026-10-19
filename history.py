@@ -6,9 +6,9 @@ month, days, weight, rhr, hr_max, bb_max, VO2max, max_VO2max, stress,
 calories, moderate, intense, total (= moderate + 2 * intense).
 
 Installation :
-    pip install garminconnect pandas openpyxl python-dotenv
+    pip install garminconnect pandas openpyxl python-dotenv tqdm
   ou avec uv :
-    uv run --with garminconnect --with pandas --with openpyxl --with python-dotenv garmin_history.py
+    uv run --with garminconnect --with pandas --with openpyxl --with python-dotenv --with tqdm history.py
 
 Identifiants (jamais écrits dans le code) :
   1. Fichier .env à côté du script (voir .env.example) :
@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pandas as pd
 from garminconnect import Garmin
+from tqdm.auto import tqdm
 
 try:
     from dotenv import load_dotenv
@@ -110,18 +111,24 @@ def fetch_day(api: Garmin, d: str) -> dict:
 
 def download(api: Garmin, start: date, end: date) -> dict:
     cache = json.loads(CACHE_FILE.read_text()) if CACHE_FILE.exists() else {}
-    d, n = start, 0
-    while d < end:
-        key = d.isoformat()
-        # on retélécharge toujours les 3 derniers jours (données incomplètes)
-        if key not in cache or d >= end - timedelta(days=3):
-            cache[key] = fetch_day(api, key)
-            n += 1
-            if n % 25 == 0:
-                CACHE_FILE.write_text(json.dumps(cache))
-                print(f"  {key} ...")
-            time.sleep(0.4)  # ménage le serveur Garmin
-        d += timedelta(days=1)
+    total = max(0, (end - start).days)   # la borne 'end' est exclusive
+    n = 0
+    with tqdm(total=total, unit="j", desc="Téléchargement",
+              disable=None, dynamic_ncols=True) as bar:
+        bar.set_postfix_str("0 téléchargés")
+        d = start
+        while d < end:
+            key = d.isoformat()
+            # on retélécharge toujours les 3 derniers jours (données incomplètes)
+            if key not in cache or d >= end - timedelta(days=3):
+                cache[key] = fetch_day(api, key)
+                n += 1
+                bar.set_postfix_str(f"{n} téléchargés")
+                if n % 25 == 0:
+                    CACHE_FILE.write_text(json.dumps(cache))
+                time.sleep(0.4)  # ménage le serveur Garmin
+            d += timedelta(days=1)
+            bar.update(1)
     CACHE_FILE.write_text(json.dumps(cache))
     return cache
 
