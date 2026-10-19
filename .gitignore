@@ -10,3 +10,7 @@ __pycache__/
 
 # local Numbers workbook (habit plan) - personal data, not published
 plan_habitudes.numbers
+
+# smoke test (CI) : données synthétiques et sorties d'analyse
+fixtures/
+out/

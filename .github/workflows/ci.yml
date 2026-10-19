@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Check that the scripts compile
+        run: uv run python -m compileall -q history.py analysis.py analysis_fine.py tests/make_fixtures.py
+
+      - name: Check that the scripts import
+        run: uv run python -c "import history, analysis, analysis_fine"
+
+      - name: Generate synthetic fixtures
+        run: uv run python tests/make_fixtures.py --out fixtures
+
+      - name: Run analysis.py
+        run: uv run python analysis.py --csv fixtures/history.csv --out out
+
+      - name: Run analysis_fine.py
+        run: uv run python analysis_fine.py --cache fixtures/garmin_daily_cache.json --out out --shifts 20 --boot 20
+
+      - name: Check the outputs
+        run: |
+          for f in correlations.csv correlations.png \
+                   correlations_fine.csv correlations_weekly.png \
+                   correlations_daily.png seasonality.png raw_vs_adjusted.png; do
+            test -s "out/$f" || { echo "::error::out/$f manquant ou vide"; exit 1; }
+          done
+          echo "Tous les fichiers de sortie sont présents."
