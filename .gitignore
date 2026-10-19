@@ -14,3 +14,6 @@ plan_habitudes.numbers
 # smoke test (CI) : données synthétiques et sorties d'analyse
 fixtures/
 out/
+
+# fichiers de sauvegarde/pointe contenant les données Garmin réelles
+*.ckp
