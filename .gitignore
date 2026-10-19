@@ -7,3 +7,6 @@ activity.xlsx
 *.csv
 __pycache__/
 *.pyc
+
+# local Numbers workbook (habit plan) - personal data, not published
+plan_habitudes.numbers
