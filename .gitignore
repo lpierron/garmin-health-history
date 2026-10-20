@@ -17,3 +17,6 @@ out/
 
 # fichiers de sauvegarde/pointe contenant les données Garmin réelles
 *.ckp
+
+# journal d'audit de sécurité local : jamais publié
+SECURITY_AUDIT_LOG.md
