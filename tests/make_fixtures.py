@@ -71,6 +71,15 @@ def daily_cache(start: date, days: int, seed: int = 0) -> dict:
             moderate = max(0.0, rng.gauss(3, 2))
             intense = 0.0
             calories = max(4.0, rng.gauss(18, 6))
+            steps = 0
+            sleep_score = None
+            sleep_hours = None
+        else:
+            # pas : plus le week-end
+            steps = round(6500 + 2500 * season + 1800 * weekend + rng.gauss(0, 900))
+            # sommeil : 6-8h, score 55-90, un peu mieux le week-end
+            sleep_hours = round(7.0 + 0.3 * season + 0.4 * weekend + rng.gauss(0, 0.6), 2)
+            sleep_score = round(65 + 10 * season + 5 * weekend + rng.gauss(0, 8))
 
         row = {
             "rhr": round(rhr, 0),
@@ -81,6 +90,9 @@ def daily_cache(start: date, days: int, seed: int = 0) -> dict:
             "moderate": round(moderate, 0),
             "intense": round(intense, 0),
             "VO2max": round(vo2max, 1),
+            "steps": steps,
+            "sleep_score": sleep_score,
+            "sleep_hours": sleep_hours,
             # la balance n'est pas utilisée tous les jours
             "weight": round(weight, 3) if (d.weekday() in (0, 2, 4) or rng.random() < 0.1) else None,
         }

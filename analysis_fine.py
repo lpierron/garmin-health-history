@@ -54,6 +54,7 @@ ACT_LABEL = {
     "calories": "Calories actives",
     "load7": "Charge 7 jours",
     "load4w": "Charge 4 semaines",
+    "steps": "Pas",
 }
 HEALTH_LABEL = {
     "rhr": "FC repos",
@@ -61,14 +62,18 @@ HEALTH_LABEL = {
     "bb_max": "Body Battery max",
     "weight": "Poids",
     "VO2max": "VO2max",
+    "sleep_score": "Score sommeil",
+    "sleep_hours": "Sommeil",
 }
 UNITS = {"rhr": "bpm", "stress": "pts", "bb_max": "pts", "weight": "kg", "VO2max": "ml/kg/min",
-         "total": "min/j", "moderate": "min/j", "intense": "min/j", "calories": "kcal/j"}
-GOOD = {"rhr": -1, "stress": -1, "bb_max": +1, "weight": -1, "VO2max": +1}  # sens favorable
-DAILY_ACT = ["moderate", "intense", "total", "calories", "load7"]
-DAILY_HEALTH = ["rhr", "stress", "bb_max"]            # poids/VO2max trop épars au jour le jour
-WEEKLY_ACT = ["moderate", "intense", "total", "calories", "load4w"]
-WEEKLY_HEALTH = ["rhr", "stress", "bb_max", "weight", "VO2max"]
+         "total": "min/j", "moderate": "min/j", "intense": "min/j", "calories": "kcal/j",
+         "steps": "pas", "sleep_score": "pts", "sleep_hours": "h"}
+GOOD = {"rhr": -1, "stress": -1, "bb_max": +1, "weight": -1, "VO2max": +1,
+        "sleep_score": +1, "sleep_hours": +1}
+DAILY_ACT = ["moderate", "intense", "total", "calories", "load7", "steps"]
+DAILY_HEALTH = ["rhr", "stress", "bb_max", "sleep_score", "sleep_hours"]
+WEEKLY_ACT = ["moderate", "intense", "total", "calories", "load4w", "steps"]
+WEEKLY_HEALTH = ["rhr", "stress", "bb_max", "weight", "VO2max", "sleep_score", "sleep_hours"]
 MONTHS = ["janv.", "févr.", "mars", "avr.", "mai", "juin",
           "juil.", "août", "sept.", "oct.", "nov.", "déc."]
 
@@ -347,7 +352,8 @@ def main():
     print(f"=== DONNÉES ===\nPériode : {daily.index.min().date()} → {daily.index.max().date()}"
           f"  ({len(daily)} jours, {len(weekly)} semaines complètes)")
     print(f"Jours « montre non portée » exclus (calories < {a.min_cal:.0f}) : {n_off}")
-    cov = (daily[["rhr", "stress", "bb_max", "weight", "VO2max", "total"]].notna().mean() * 100).round(0)
+    cov = (daily[["rhr", "stress", "bb_max", "weight", "VO2max", "total",
+                  "steps", "sleep_score", "sleep_hours"]].notna().mean() * 100).round(0)
     print("Couverture journalière : " + ", ".join(f"{k} {int(v)} %" for k, v in cov.items()))
 
     # --- correction
@@ -362,7 +368,8 @@ def main():
     w_cols = sorted(set(WEEKLY_ACT + WEEKLY_HEALTH))
     d_raw, d_adj, _ = adjust(daily, True, d_cols)
     w_raw, w_adj, w_info = adjust(weekly, False, w_cols)
-    seas_cols = ["rhr", "stress", "bb_max", "weight", "VO2max", "total", "intense", "calories"]
+    seas_cols = ["rhr", "stress", "bb_max", "weight", "VO2max", "total", "intense",
+                 "calories", "steps", "sleep_score", "sleep_hours"]
     _, _, seas_info = adjust(weekly, False, seas_cols)
 
     # --- 1. saisonnalité
@@ -378,7 +385,8 @@ def main():
 
     # --- 2. tendances
     print("\n=== 2. TENDANCES DE FOND (pente de Theil-Sen / an, IC95 % bootstrap par blocs) ===")
-    tr = trend_table(weekly, WEEKLY_HEALTH + ["total", "intense", "calories"], a.boot, rng)
+    tr = trend_table(weekly, WEEKLY_HEALTH + ["total", "intense", "calories", "steps"],
+                     a.boot, rng)
     for _, r in tr.iterrows():
         name = HEALTH_LABEL.get(r.variable) or ACT_LABEL[r.variable]
         excl = (r.lo > 0) or (r.hi < 0)

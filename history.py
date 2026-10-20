@@ -46,12 +46,14 @@ CACHE_FILE = Path("garmin_daily_cache.json")  # données journalières déjà t�
 
 # ------------------------------------------------- synthèse de la semaine
 COLS_DAILY = ["rhr", "hr_max", "stress", "bb_max", "calories",
-              "moderate", "intense", "weight", "VO2max"]
+              "moderate", "intense", "weight", "VO2max",
+              "steps", "sleep_score", "sleep_hours"]
 MOIS = ["janv", "févr", "mars", "avr", "mai", "juin",
         "juil", "août", "sept", "oct", "nov", "déc"]
 # sens "favorable" (+1 : plus haut = mieux, -1 : plus bas = mieux) ; l'activité
 # et la FC max n'ont pas de sens favorable défini (plus n'est pas toujours mieux)
-SENS = {"rhr": -1, "stress": -1, "bb_max": +1, "weight": -1, "VO2max": +1}
+SENS = {"rhr": -1, "stress": -1, "bb_max": +1, "weight": -1, "VO2max": +1,
+        "steps": +1, "sleep_score": +1, "sleep_hours": +1}
 MIN_CAL = 50   # calories actives min. pour considérer un jour « actif »
 # indicateur -> (libellé affiché, nombre de décimales, agrégation)
 #   "somme" : cumulé sur la semaine (activité, comme dans history.csv)
@@ -61,15 +63,18 @@ SPEC = {
     "intense": ("Intense (min)", 0, "somme"),
     "total": ("Total pondéré (min)", 0, "somme"),
     "calories": ("Calories actives (kcal)", 0, "somme"),
+    "steps": ("Pas", 0, "somme"),
     "rhr": ("FC repos (bpm)", 0, "moyenne"),
     "hr_max": ("FC max (bpm)", 0, "moyenne"),
     "stress": ("Stress (pts)", 0, "moyenne"),
     "bb_max": ("Body Battery max (pts)", 0, "moyenne"),
     "VO2max": ("VO2max (ml/kg/min)", 1, "moyenne"),
+    "sleep_score": ("Score sommeil", 0, "moyenne"),
+    "sleep_hours": ("Sommeil (h)", 2, "moyenne"),
     "weight": ("Poids (kg)", 1, "moyenne"),
 }
-ORDRE = ["moderate", "intense", "total", "calories",
-         "rhr", "hr_max", "stress", "bb_max", "VO2max", "weight"]
+ORDRE = ["moderate", "intense", "total", "calories", "steps",
+         "rhr", "hr_max", "stress", "bb_max", "VO2max", "sleep_score", "sleep_hours", "weight"]
 
 
 def login() -> Garmin:
@@ -113,30 +118,57 @@ def safe(fn, *args):
         return None
 
 
-def fetch_day(api: Garmin, d: str) -> dict:
+def fetch_day(api: Garmin, d: str, existing: dict | None = None,
+              with_steps: bool = False,
+              with_sleep: bool = False) -> dict:
     s = safe(api.get_stats, d) or {}
-    row = {
-        "rhr": s.get("restingHeartRate"),
-        "hr_max": s.get("maxHeartRate"),
-        "stress": s.get("averageStressLevel"),
-        "bb_max": s.get("bodyBatteryHighestValue"),
-        "calories": s.get("activeKilocalories"),
-        "moderate": s.get("moderateIntensityMinutes"),
-        "intense": s.get("vigorousIntensityMinutes"),
-    }
+    # parte de l'entrée cache existante pour ne pas écraser un indicateur
+    # qu'on ne rafraîchit pas à cet appel (ex. pas déjà connus, sommeil non demandé)
+    row = dict(existing) if existing else {}
+    row["rhr"] = s.get("restingHeartRate")
+    row["hr_max"] = s.get("maxHeartRate")
+    row["stress"] = s.get("averageStressLevel")
+    row["bb_max"] = s.get("bodyBatteryHighestValue")
+    row["calories"] = s.get("activeKilocalories")
+    row["moderate"] = s.get("moderateIntensityMinutes")
+    row["intense"] = s.get("vigorousIntensityMinutes")
+    if with_steps:
+        steps = safe(api.get_steps_data, d)
+        if steps and steps[0].get("totalSteps") is not None:
+            row["steps"] = steps[0].get("totalSteps")
+    if with_sleep:
+        sl = safe(api.get_sleep_data, d)
+        if sl:
+            row["sleep_score"] = sl.get("sleepScore")
+            dur = sl.get("durationInSeconds")
+            if dur:
+                row["sleep_hours"] = round(dur / 3600, 2)
     mm = safe(api.get_max_metrics, d)
     if mm:
         try:
             row["VO2max"] = mm[0]["generic"]["vo2MaxPreciseValue"]
         except (KeyError, IndexError, TypeError):
-            row["VO2max"] = None
+            pass  # garder la valeur en cache si l'appel échoue
     bc = safe(api.get_body_composition, d, d)
     if bc and bc.get("totalAverage", {}).get("weight"):
         row["weight"] = bc["totalAverage"]["weight"] / 1000  # g -> kg
     return row
 
 
-def download(api: Garmin, start: date, end: date) -> dict:
+def _need_refresh(entry: dict | None, with_steps: bool, with_sleep: bool) -> bool:
+    """Une journée déjà en cache doit être retéléchargée si un indicateur
+    demandé manque (ex. premier run sans --steps, puis run avec --steps)."""
+    if entry is None:
+        return True
+    if with_steps and entry.get("steps") is None:
+        return True
+    if with_sleep and (entry.get("sleep_score") is None or entry.get("sleep_hours") is None):
+        return True
+    return False
+
+
+def download(api: Garmin, start: date, end: date, with_steps: bool = False,
+             with_sleep: bool = False) -> dict:
     cache = json.loads(CACHE_FILE.read_text()) if CACHE_FILE.exists() else {}
     total = max(0, (end - start).days)   # la borne 'end' est exclusive
     n = 0
@@ -147,8 +179,12 @@ def download(api: Garmin, start: date, end: date) -> dict:
         while d < end:
             key = d.isoformat()
             # on retélécharge toujours les 3 derniers jours (données incomplètes)
-            if key not in cache or d >= end - timedelta(days=3):
-                cache[key] = fetch_day(api, key)
+            # et toute journée manquante un indicateur demandé (pas, sommeil)
+            if (_need_refresh(cache.get(key), with_steps, with_sleep)
+                    or d >= end - timedelta(days=3)):
+                cache[key] = fetch_day(api, key, existing=cache.get(key),
+                                       with_steps=with_steps,
+                                       with_sleep=with_sleep)
                 n += 1
                 bar.set_postfix_str(f"{n} téléchargés")
                 if n % 25 == 0:
@@ -175,8 +211,11 @@ def monthly(cache: dict) -> pd.DataFrame:
         "max_VO2max": g["VO2max"].max(),
         "stress": g["stress"].mean(),
         "calories": g["calories"].sum(),
+        "steps": g["steps"].sum(),
         "moderate": g["moderate"].sum(),
         "intense": g["intense"].sum(),
+        "sleep_score": g["sleep_score"].mean(),
+        "sleep_hours": g["sleep_hours"].mean(),
     })
     out["total"] = out["moderate"] + 2 * out["intense"]
     out.index = out.index.astype(str)
@@ -260,7 +299,9 @@ def synthese_semaine(cache: dict, jours: int = 7, semaines_ref: int = 12) -> str
         L.append("  Référence : pas d'historique suffisant pour comparer")
     L.append(f"  Couverture : {int((week['calories'] >= MIN_CAL).sum())} j actifs / {n}"
              f" | poids : {_mesures(int(week['weight'].notna().sum()))}"
-             f" | VO2max : {_mesures(int(week['VO2max'].notna().sum()))}")
+             f" | VO2max : {_mesures(int(week['VO2max'].notna().sum()))}"
+             f" | pas : {_mesures(int(week['steps'].notna().sum()))}"
+             f" | sommeil : {_mesures(int(week['sleep_score'].notna().sum()))}")
 
     L.append("")
     L.append("  ACTIVITÉ : cumul de la semaine | SANTÉ : moyenne de la semaine")
@@ -336,13 +377,17 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--start", default="2020-08-01")
     p.add_argument("--end", default=date.today().isoformat())
+    p.add_argument("--steps", action="store_true",
+                   help="récupère aussi le nombre de pas quotidiens (2 appels API/jour supplémentaires)")
+    p.add_argument("--sleep", action="store_true",
+                   help="récupère aussi le score et la durée du sommeil (2 appels API/jour supplémentaires)")
     a = p.parse_args()
     start = datetime.strptime(a.start, "%Y-%m-%d").date()
     end = datetime.strptime(a.end, "%Y-%m-%d").date()
 
     api = login()
     print("Connecté. Téléchargement (long la première fois, ensuite en cache)...")
-    cache = download(api, start, end)
+    cache = download(api, start, end, with_steps=a.steps, with_sleep=a.sleep)
     table = monthly(cache)
     table.to_csv("history.csv", index=False)
     table.to_excel("activity.xlsx", index=False)
