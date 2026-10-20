@@ -44,6 +44,33 @@ except ImportError:
 TOKEN_DIR = Path.home() / ".garmin_tokens"   # jetons de session (pas le mot de passe)
 CACHE_FILE = Path("garmin_daily_cache.json")  # données journalières déjà téléchargées
 
+# ------------------------------------------------- synthèse de la semaine
+COLS_DAILY = ["rhr", "hr_max", "stress", "bb_max", "calories",
+              "moderate", "intense", "weight", "VO2max"]
+MOIS = ["janv", "févr", "mars", "avr", "mai", "juin",
+        "juil", "août", "sept", "oct", "nov", "déc"]
+# sens "favorable" (+1 : plus haut = mieux, -1 : plus bas = mieux) ; l'activité
+# et la FC max n'ont pas de sens favorable défini (plus n'est pas toujours mieux)
+SENS = {"rhr": -1, "stress": -1, "bb_max": +1, "weight": -1, "VO2max": +1}
+MIN_CAL = 50   # calories actives min. pour considérer un jour « actif »
+# indicateur -> (libellé affiché, nombre de décimales, agrégation)
+#   "somme" : cumulé sur la semaine (activité, comme dans history.csv)
+#   "moyenne" : niveau moyen sur la semaine (santé)
+SPEC = {
+    "moderate": ("Modérée (min)", 0, "somme"),
+    "intense": ("Intense (min)", 0, "somme"),
+    "total": ("Total pondéré (min)", 0, "somme"),
+    "calories": ("Calories actives (kcal)", 0, "somme"),
+    "rhr": ("FC repos (bpm)", 0, "moyenne"),
+    "hr_max": ("FC max (bpm)", 0, "moyenne"),
+    "stress": ("Stress (pts)", 0, "moyenne"),
+    "bb_max": ("Body Battery max (pts)", 0, "moyenne"),
+    "VO2max": ("VO2max (ml/kg/min)", 1, "moyenne"),
+    "weight": ("Poids (kg)", 1, "moyenne"),
+}
+ORDRE = ["moderate", "intense", "total", "calories",
+         "rhr", "hr_max", "stress", "bb_max", "VO2max", "weight"]
+
 
 def login() -> Garmin:
     TOKEN_DIR.mkdir(exist_ok=True, mode=0o700)
@@ -157,6 +184,154 @@ def monthly(cache: dict) -> pd.DataFrame:
     return out.round(1).reset_index()
 
 
+# ------------------------------------------------------ synthèse hebdomadaire
+def _daily_frame(cache: dict) -> pd.DataFrame:
+    """Cache journalier -> DataFrame indexé par la date.
+
+    Les colonnes absentes du cache deviennent NaN (une journée sans balance
+    n'a pas de poids, etc.). `total` = moderate + 2 * intense, comme dans
+    `monthly()`.
+    """
+    if not cache:
+        return pd.DataFrame(columns=COLS_DAILY + ["total"],
+                            index=pd.DatetimeIndex([]))
+    df = pd.DataFrame.from_dict(cache, orient="index")
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index().apply(pd.to_numeric, errors="coerce")
+    df = df.reindex(columns=COLS_DAILY)
+    df["total"] = df["moderate"] + 2 * df["intense"]
+    return df
+
+
+def _date(ts) -> str:
+    return f"{ts.day} {MOIS[ts.month - 1]} {ts.year}"
+
+
+def _date_court(ts) -> str:
+    return f"{ts.day} {MOIS[ts.month - 1]}"
+
+
+def _num(v, dec: int = 0) -> str:
+    if v is None or pd.isna(v):
+        return "-"
+    return f"{v:.{dec}f}"
+
+
+def _pl(n: int, singulier: str, pluriel: str | None = None) -> str:
+    """Accorde un nom au nombre (1 semaine / 3 semaines)."""
+    if n == 1:
+        return singulier
+    return pluriel or singulier + "s"
+
+
+def _agg(s: pd.Series, mode: str):
+    """Agrège une série selon le mode : somme cumulée ou moyenne."""
+    return s.sum(min_count=1) if mode == "somme" else s.mean()
+
+
+def _mesures(n: int) -> str:
+    """Accorde « mesure » au nombre (0 mesure / 3 mesures)."""
+    return f"{n} mesure" if n <= 1 else f"{n} mesures"
+
+
+def synthese_semaine(cache: dict, jours: int = 7, semaines_ref: int = 12) -> str:
+    """Synthèse des `jours` derniers jours, comparés aux `semaines_ref` semaines
+    précédentes. Retourne un texte (affiché par `main`, testable sans Garmin)."""
+    df = _daily_frame(cache)
+    if df.empty:
+        return "  (aucune donnée journalière dans le cache)"
+
+    n = min(jours, len(df))
+    week = df.iloc[-n:]                       # la fenêtre observée
+    ref = df.iloc[-(n + semaines_ref * 7):-n]  # la période de référence
+    n_blocs = len(ref) // 7
+    blocs = [ref.iloc[i:i + 7] for i in range(0, n_blocs * 7, 7)]
+
+    L = [f"=== SYNTHÈSE DE LA SEMAINE ({_date(week.index.min())} → "
+         f"{_date(week.index.max())}) ==="]
+    L.append(f"  Fenêtre : {n} {_pl(n, 'dernier jour', 'derniers jours')} "
+             f"({_date_court(week.index.min())} → {_date_court(week.index.max())})")
+    if n_blocs:
+        ref_label = ("de la semaine précédente" if n_blocs == 1
+                     else f"des {n_blocs} semaines précédentes")
+        L.append(f"  Référence : moyenne hebdomadaire {ref_label} "
+                 f"({_date_court(ref.index.min())} → {_date_court(ref.index.max())})")
+    else:
+        L.append("  Référence : pas d'historique suffisant pour comparer")
+    L.append(f"  Couverture : {int((week['calories'] >= MIN_CAL).sum())} j actifs / {n}"
+             f" | poids : {_mesures(int(week['weight'].notna().sum()))}"
+             f" | VO2max : {_mesures(int(week['VO2max'].notna().sum()))}")
+
+    L.append("")
+    L.append("  ACTIVITÉ : cumul de la semaine | SANTÉ : moyenne de la semaine")
+    L.append(f"  {'INDICATEUR':<26s}{'SEMAINE':>10s}{'RÉFÉRENCE':>10s}"
+             f"{'ÉCART':>9s}   SENS")
+    fav = unfav = n_stable = hors = 0
+    non_comparables = []
+    wvs, refs = {}, {}
+    for c in ORDRE:
+        lab, dec, mode = SPEC[c]
+        wv = _agg(week[c], mode)
+        nw = int(week[c].notna().sum())
+        nr = int(ref[c].notna().sum())
+        # référence : moyenne des blocs hebdomadaires (somme ou moyenne)
+        bv = [_agg(b[c], mode) for b in blocs]
+        bv = [v for v in bv if not pd.isna(v)]
+        rv = sum(bv) / len(bv) if bv else float("nan")
+        d = wv - rv
+        d_r = round(d, dec) if not pd.isna(d) else float("nan")
+        if d_r == 0:
+            d_r = 0.0   # normalise -0.0 (sinon on afficherait « +-0 »)
+        # comparable : assez de mesures des deux côtés
+        comparable = bool(nw >= 2 and nr >= 5 and not pd.isna(d))
+        # hors de la plage des semaines de référence ?
+        # (3 blocs minimum : en dessous, la plage est trop poorre pour conclure)
+        hors_plage = bool(comparable and n_blocs >= 3 and bv
+                          and (wv < min(bv) or wv > max(bv)))
+        sens = "—"
+        if comparable and c in SENS:
+            # le sens est celui de l'écart arrondi : un écart nul est « stable »
+            sens = ("favorable" if d_r * SENS[c] > 0
+                    else "défavorable" if d_r * SENS[c] < 0 else "stable")
+            fav += 1 if sens == "favorable" else 0
+            unfav += 1 if sens == "défavorable" else 0
+            n_stable += 1 if sens == "stable" else 0
+        if hors_plage:
+            sens += " (hors plage)"
+            hors += 1
+        if c in SENS and not comparable:
+            non_comparables.append(f"{lab.split(' (')[0]} ({_mesures(nw)})")
+        wvs[c], refs[c] = wv, rv
+        L.append(f"  {lab:<26s}{_num(wv, dec):>10s}{_num(rv, dec):>10s}"
+                 f"{('+' if d_r >= 0 else '') + _num(d_r, dec):>9s}   {sens}")
+
+    if non_comparables and n_blocs:
+        L.append("")
+        L.append(f"  Non comparable(s) : {', '.join(non_comparables)}.")
+
+    # --- verdict
+    L.append("")
+    L.append("  VERDICT")
+    n_comp = fav + unfav + n_stable
+    if n_comp:
+        L.append(f"    Santé : {fav} en amélioration, {unfav} en dégradation, "
+                 f"{n_stable} {_pl(n_stable, 'stable', 'stables')} "
+                 f"(sur {n_comp} comparables).")
+    else:
+        L.append("    Santé : aucun indicateur comparable sur la période.")
+    if n_blocs:
+        dt = wvs["total"] - refs["total"]
+        seuil = n          # 1 min/j d'écart = seuil de « stable »
+        tend = "en hausse" if dt > seuil else "en baisse" if dt < -seuil else "stable"
+        L.append(f"    Activité : charge pondérée {tend} "
+                 f"({dt:+.0f} min/sem vs référence).")
+        if hors:
+            L.append(f"    {hors} écart(s) hors de la plage des {n_blocs} dernières "
+                     f"{_pl(n_blocs, 'semaine')}.")
+    L.append("    Semaine isolée : à lire comme un instantané, pas comme une tendance.")
+    return "\n".join(L)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--start", default="2020-08-01")
@@ -172,6 +347,8 @@ def main():
     table.to_csv("history.csv", index=False)
     table.to_excel("activity.xlsx", index=False)
     print(table.tail(6).to_string(index=False))
+    print()
+    print(synthese_semaine(cache))
     print("\nFichiers créés : history.csv, activity.xlsx")
 
 

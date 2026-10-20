@@ -73,6 +73,24 @@ Both contain one row per month with these columns:
 
 where `total = moderate + 2 * intense`.
 
+### Weekly synthesis
+
+After the last six months, the script prints a synthesis of the **last 7 days**
+(rolling window) compared with the **12 previous weeks**:
+
+- activity (moderate, intense, weighted total, active calories) summed over the
+  week, as in `history.csv`, and health indicators (resting HR, max HR, stress,
+  Body Battery, VO2max, weight) averaged over the week;
+- the gap to the reference period (the weekly average of the 12 previous weeks)
+  for each indicator, with a favourable/unfavourable reading for the health
+  indicators;
+- a flag when the week falls outside the range of the reference weeks, and a
+  short verdict.
+
+The synthesis is computed from the daily cache, so it costs no extra API call.
+Indicators with too few measurements to compare are listed as such instead of
+being interpreted.
+
 ## How it works
 
 - Daily data is cached in `garmin_daily_cache.json`; already-fetched days are not

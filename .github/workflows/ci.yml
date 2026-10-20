@@ -34,6 +34,17 @@ jobs:
       - name: Generate synthetic fixtures
         run: uv run python tests/make_fixtures.py --out fixtures
 
+      - name: Smoke-test the weekly synthesis
+        run: |
+          uv run python -c "
+          import json
+          from history import synthese_semaine
+          cache = json.load(open('fixtures/garmin_daily_cache.json'))
+          out = synthese_semaine(cache)
+          assert 'SYNTHÈSE DE LA SEMAINE' in out, out
+          print(out)
+          "
+
       - name: Run analysis.py
         run: uv run python analysis.py --csv fixtures/history.csv --out out
 
