@@ -12,6 +12,7 @@ Deux usages :
 
 Aucune dépendance : ce module doit rester importable sans pandas.
 """
+
 import math
 
 

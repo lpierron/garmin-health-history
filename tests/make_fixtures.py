@@ -15,6 +15,7 @@ aléatoire à graine fixe.
 Usage :
     python tests/make_fixtures.py --out fixtures
 """
+
 import argparse
 import json
 import math
@@ -24,7 +25,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from history import display_table, monthly  # noqa: E402
+from history import display_table, monthly
 
 
 def _off_days(dates: list[date], rng: random.Random) -> set[date]:
@@ -33,7 +34,7 @@ def _off_days(dates: list[date], rng: random.Random) -> set[date]:
     hebdomadaire)."""
     off: set[date] = set()
     for i in range(0, len(dates), 7):
-        week = dates[i:i + 7]
+        week = dates[i : i + 7]
         for d in rng.sample(week, rng.choice([0, 0, 1, 1, 2])):
             off.add(d)
     return off
@@ -109,7 +110,9 @@ def daily_cache(start: date, days: int, seed: int = 0, partial: bool = False) ->
             "pred_5k": pred_5k,
             "pred_half": pred_half,
             # la balance n'est pas utilisée tous les jours
-            "weight": round(weight, 3) if (d.weekday() in (0, 2, 4) or rng.random() < 0.1) else None,
+            "weight": round(weight, 3)
+            if (d.weekday() in (0, 2, 4) or rng.random() < 0.1)
+            else None,
         }
         if partial:
             for c in ("steps", "sleep_score", "sleep_hours", "pred_5k", "pred_half"):
@@ -123,8 +126,11 @@ def main():
     p.add_argument("--out", type=Path, default=Path("fixtures"), help="dossier de sortie")
     p.add_argument("--years", type=int, default=6, help="durée couverte (années)")
     p.add_argument("--seed", type=int, default=0, help="graine du générateur")
-    p.add_argument("--partial", action="store_true",
-                   help="cache sans les indicateurs optionnels (pas, sommeil, prédictions)")
+    p.add_argument(
+        "--partial",
+        action="store_true",
+        help="cache sans les indicateurs optionnels (pas, sommeil, prédictions)",
+    )
     a = p.parse_args()
 
     # on commence un lundi et on finit un dimanche : toutes les semaines sont
@@ -141,8 +147,7 @@ def main():
     # même mise en forme que history.py : durées « hh:mm » / « hh:mm:ss »
     display_table(monthly(cache)).to_csv(a.out / "history.csv", index=False)
 
-    print(f"{a.out/'history.csv'} : {len(cache)} jours, "
-          f"{len(monthly(cache))} mois")
+    print(f"{a.out / 'history.csv'} : {len(cache)} jours, {len(monthly(cache))} mois")
 
 
 if __name__ == "__main__":

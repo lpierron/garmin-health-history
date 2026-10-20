@@ -16,6 +16,7 @@ Usage :
 
 Dépendances : pandas, numpy, scipy, matplotlib
 """
+
 import argparse
 from pathlib import Path
 
@@ -50,9 +51,17 @@ HEALTH = {
     "pred_half": "Prédiction semi-marathon",
 }
 # sens "favorable" (+1 : plus haut = mieux, -1 : plus bas = mieux)
-GOOD_DIRECTION = {"rhr": -1, "VO2max": +1, "weight": -1, "stress": -1, "bb_max": +1,
-                  "sleep_score": +1, "sleep_hours": +1,
-                  "pred_5k": -1, "pred_half": -1}
+GOOD_DIRECTION = {
+    "rhr": -1,
+    "VO2max": +1,
+    "weight": -1,
+    "stress": -1,
+    "bb_max": +1,
+    "sleep_score": +1,
+    "sleep_hours": +1,
+    "pred_5k": -1,
+    "pred_half": -1,
+}
 MIN_PAIRS = 12  # en dessous, une corrélation n'a pas de sens
 # colonnes attendues dans history.csv : un indicateur absent devient une
 # colonne vide (NaN) au lieu de faire échouer le script
@@ -93,10 +102,9 @@ def load(path: Path, min_days: int) -> pd.DataFrame:
     df["month"] = pd.PeriodIndex(df["month"], freq="M")
     df = df.sort_values("month").set_index("month")
     # colonnes fixes : les indicateurs absents du CSV restent des colonnes vides
-    df = df.reindex(columns=["days"] + COLS)
+    df = df.reindex(columns=["days", *COLS])
     # les durées sont écrites « hh:mm » / « hh:mm:ss » : on les relit en nombre
-    for c, conv in (("sleep_hours", parse_hm), ("pred_5k", parse_hms),
-                    ("pred_half", parse_hms)):
+    for c, conv in (("sleep_hours", parse_hm), ("pred_5k", parse_hms), ("pred_half", parse_hms)):
         if c in df.columns:
             df[c] = df[c].map(conv)
     n0 = len(df)
@@ -178,20 +186,31 @@ def tercile_contrast(df: pd.DataFrame, activity="total") -> pd.DataFrame:
         if len(low) < 5 or len(high) < 5:
             continue
         _, p = stats.mannwhitneyu(high, low, alternative="two-sided")
-        rows.append(dict(health=h, low_median=low.median(), high_median=high.median(),
-                         diff=high.median() - low.median(), p=p, n_low=len(low), n_high=len(high)))
+        rows.append(
+            dict(
+                health=h,
+                low_median=low.median(),
+                high_median=high.median(),
+                diff=high.median() - low.median(),
+                p=p,
+                n_low=len(low),
+                n_high=len(high),
+            )
+        )
     return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------- sorties
 def heatmap(corr: pd.DataFrame, path: Path):
     fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), sharey=True)
-    for ax, lag, title in zip(axes, (0, 1), ("Même mois", "Activité M → santé M+1")):
+    for ax, lag, title in zip(axes, (0, 1), ("Même mois", "Activité M → santé M+1"), strict=True):
         sub = corr[corr.lag == lag]
         tau = sub.pivot(index="activity", columns="health", values="tau").reindex(
-            index=list(ACTIVITY), columns=list(HEALTH))
+            index=list(ACTIVITY), columns=list(HEALTH)
+        )
         q = sub.pivot(index="activity", columns="health", values="q").reindex(
-            index=list(ACTIVITY), columns=list(HEALTH))
+            index=list(ACTIVITY), columns=list(HEALTH)
+        )
         im = ax.imshow(tau.values, cmap="RdBu_r", vmin=-0.6, vmax=0.6)
         ax.set_xticks(range(len(HEALTH)), [HEALTH[c] for c in tau.columns], rotation=30, ha="right")
         ax.set_yticks(range(len(ACTIVITY)), [ACTIVITY[r] for r in tau.index])
@@ -214,8 +233,10 @@ def verdict(h: str, tau: float) -> str:
 
 
 def report(df, corr, trend, terc, alpha):
-    print(f"\n=== PÉRIODE : {df.index.min()} → {df.index.max()}  "
-          f"({df['days'].notna().sum()} mois exploitables) ===")
+    print(
+        f"\n=== PÉRIODE : {df.index.min()} → {df.index.max()}  "
+        f"({df['days'].notna().sum()} mois exploitables) ==="
+    )
 
     print("\n--- 1. TENDANCES DE FOND (Kendall vs temps) ---")
     for _, r in trend.iterrows():
@@ -233,15 +254,19 @@ def report(df, corr, trend, terc, alpha):
         sig = sig.reindex(sig.tau.abs().sort_values(ascending=False).index)
     for _, r in sig.iterrows():
         when = "même mois" if r.lag == 0 else "mois suivant"
-        print(f"  {ACTIVITY[r.activity]:26s} → {HEALTH[r.health]:16s} ({when:12s}) "
-              f"tau={r.tau:+.2f}  p={r.p:.3f}  q={r.q:.3f}  n={int(r.n)}  [{verdict(r.health, r.tau)}]")
+        print(
+            f"  {ACTIVITY[r.activity]:26s} → {HEALTH[r.health]:16s} ({when:12s}) "
+            f"tau={r.tau:+.2f}  p={r.p:.3f}  q={r.q:.3f}  n={int(r.n)}  [{verdict(r.health, r.tau)}]"
+        )
 
     if not terc.empty:
         print("\n--- 3. MOIS TRÈS ACTIFS vs PEU ACTIFS → santé du mois suivant (médianes) ---")
         for _, r in terc.iterrows():
-            print(f"  {HEALTH[r.health]:16s} peu actif {_fmt_val(r.health, r.low_median):>8s} | "
-                  f"très actif {_fmt_val(r.health, r.high_median):>8s} | "
-                  f"écart {_fmt_diff(r.health, r['diff'])}  (p={r.p:.3f})")
+            print(
+                f"  {HEALTH[r.health]:16s} peu actif {_fmt_val(r.health, r.low_median):>8s} | "
+                f"très actif {_fmt_val(r.health, r.high_median):>8s} | "
+                f"écart {_fmt_diff(r.health, r['diff'])}  (p={r.p:.3f})"
+            )
 
     print("\n--- LIMITES ---")
     print("  * Corrélation ≠ causalité : un mois très actif peut aussi être un mois en forme,")

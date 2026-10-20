@@ -28,7 +28,9 @@ Les indicateurs optionnels (pas, sommeil, prédictions de course) sont
 récupérés par tranches de dates (1 appel par 28 jours, ou par 365 jours pour
 les prédictions) et ne remplissent que les jours où la valeur manque.
 """
+
 import argparse
+import contextlib
 import getpass
 import json
 import os
@@ -36,6 +38,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Protocol
 
 import pandas as pd
 from garminconnect import Garmin
@@ -45,14 +48,15 @@ from units import fmt_hm, fmt_hms
 
 try:
     from dotenv import load_dotenv
+
     # .env à côté du script, quel que soit le dossier d'où on lance la commande
     load_dotenv(Path(__file__).resolve().parent / ".env")
 except ImportError:
     print("(python-dotenv non installé : le fichier .env est ignoré)")
 
-TOKEN_DIR = Path.home() / ".garmin_tokens"   # jetons de session (pas le mot de passe)
+TOKEN_DIR = Path.home() / ".garmin_tokens"  # jetons de session (pas le mot de passe)
 CACHE_FILE = Path("garmin_daily_cache.json")  # données journalières déjà téléchargées
-VERBOSE = False   # journalise les erreurs d'appel API (--verbose)
+VERBOSE = False  # journalise les erreurs d'appel API (--verbose)
 
 # l'API limite la taille des plages demandées : 28 jours pour les endpoints
 # « stats » (pas, sommeil), 365 jours pour les prédictions de course
@@ -60,18 +64,38 @@ CHUNK_DAYS = 28
 RACE_CHUNK_DAYS = 365
 
 # ------------------------------------------------- synthèse de la semaine
-COLS_DAILY = ["rhr", "hr_max", "stress", "bb_max", "calories",
-              "moderate", "intense", "weight", "VO2max",
-              "steps", "sleep_score", "sleep_hours",
-              "pred_5k", "pred_half"]
-MOIS = ["janv", "févr", "mars", "avr", "mai", "juin",
-        "juil", "août", "sept", "oct", "nov", "déc"]
+COLS_DAILY = [
+    "rhr",
+    "hr_max",
+    "stress",
+    "bb_max",
+    "calories",
+    "moderate",
+    "intense",
+    "weight",
+    "VO2max",
+    "steps",
+    "sleep_score",
+    "sleep_hours",
+    "pred_5k",
+    "pred_half",
+]
+MOIS = ["janv", "févr", "mars", "avr", "mai", "juin", "juil", "août", "sept", "oct", "nov", "déc"]
 # sens "favorable" (+1 : plus haut = mieux, -1 : plus bas = mieux) ; l'activité
 # et la FC max n'ont pas de sens favorable défini (plus n'est pas toujours mieux)
-SENS = {"rhr": -1, "stress": -1, "bb_max": +1, "weight": -1, "VO2max": +1,
-        "steps": +1, "sleep_score": +1, "sleep_hours": +1,
-        "pred_5k": -1, "pred_half": -1}
-MIN_CAL = 50   # calories actives min. pour considérer un jour « actif »
+SENS = {
+    "rhr": -1,
+    "stress": -1,
+    "bb_max": +1,
+    "weight": -1,
+    "VO2max": +1,
+    "steps": +1,
+    "sleep_score": +1,
+    "sleep_hours": +1,
+    "pred_5k": -1,
+    "pred_half": -1,
+}
+MIN_CAL = 50  # calories actives min. pour considérer un jour « actif »
 # indicateur -> (libellé affiché, nombre de décimales, agrégation)
 #   "somme" : cumulé sur la semaine (activité, comme dans history.csv)
 #   "moyenne" : niveau moyen sur la semaine (santé, pas)
@@ -94,9 +118,23 @@ SPEC = {
 }
 # indicateurs affichés sous forme de durée plutôt que de nombre
 FORMATS = {"sleep_hours": "hm", "pred_5k": "hms", "pred_half": "hms"}
-ORDRE = ["moderate", "intense", "total", "calories", "steps",
-         "rhr", "hr_max", "stress", "bb_max", "VO2max", "sleep_score", "sleep_hours",
-         "pred_5k", "pred_half", "weight"]
+ORDRE = [
+    "moderate",
+    "intense",
+    "total",
+    "calories",
+    "steps",
+    "rhr",
+    "hr_max",
+    "stress",
+    "bb_max",
+    "VO2max",
+    "sleep_score",
+    "sleep_hours",
+    "pred_5k",
+    "pred_half",
+    "weight",
+]
 
 
 def login() -> Garmin:
@@ -116,20 +154,21 @@ def login() -> Garmin:
     api = Garmin(email, password, prompt_mfa=lambda: input("Code MFA : "))
     try:
         try:
-            api.login(str(TOKEN_DIR))   # versions récentes : sauvegarde les jetons ici
+            api.login(str(TOKEN_DIR))  # versions récentes : sauvegarde les jetons ici
         except TypeError:
-            api.login()                  # anciennes versions
+            api.login()  # anciennes versions
     except Exception as e:
         if "429" in str(e) or "TooMany" in type(e).__name__:
             raise SystemExit(
                 "Garmin bloque temporairement la connexion (erreur 429).\n"
                 "Ne relancez pas en boucle : attendez 1 à 2 heures (parfois 24 h), "
                 "ou essayez depuis un autre réseau (partage de connexion du téléphone)."
-            )
+            ) from e
         raise
     # anciennes versions uniquement (garth) : sauvegarde des jetons
-    if hasattr(api, "garth"):
-        api.garth.dump(str(TOKEN_DIR))
+    garth = getattr(api, "garth", None)
+    if garth is not None:
+        garth.dump(str(TOKEN_DIR))
     return api
 
 
@@ -144,8 +183,7 @@ def safe(fn, *args):
     except Exception as e:
         if VERBOSE:
             name = getattr(fn, "__name__", str(fn))
-            print(f"  [api] {name} a échoué : {type(e).__name__}: {e}",
-                  file=sys.stderr)
+            print(f"  [api] {name} a échoué : {type(e).__name__}: {e}", file=sys.stderr)
         return None
 
 
@@ -270,7 +308,21 @@ def _merge(cache: dict, data: dict, cols) -> int:
     return n
 
 
-def fetch_day(api: Garmin, d: str, existing: dict | None = None) -> dict:
+class DayApi(Protocol):
+    """Partie de l'API Garmin utilisée pour récupérer une journée.
+
+    Décrire un protocole (plutôt que la classe `Garmin`) permet de tester
+    `fetch_day()` avec un faux objet, sans Garmin ni réseau.
+    """
+
+    def get_stats(self, cdate: str) -> dict: ...
+
+    def get_max_metrics(self, cdate: str) -> dict: ...
+
+    def get_body_composition(self, startdate: str, enddate: str | None = None) -> dict: ...
+
+
+def fetch_day(api: DayApi, d: str, existing: dict | None = None) -> dict:
     """Récupère les indicateurs quotidiens d'une date.
 
     `existing` (entrée du cache) sert de base : une valeur déjà connue n'est
@@ -290,10 +342,9 @@ def fetch_day(api: Garmin, d: str, existing: dict | None = None) -> dict:
     _put(row, "steps", s.get("totalSteps"))
     mm = safe(api.get_max_metrics, d)
     if mm:
-        try:
+        # garder la valeur en cache si l'appel échoue
+        with contextlib.suppress(KeyError, IndexError, TypeError):
             _put(row, "VO2max", mm[0]["generic"]["vo2MaxPreciseValue"])
-        except (KeyError, IndexError, TypeError):
-            pass  # garder la valeur en cache si l'appel échoue
     bc = safe(api.get_body_composition, d, d)
     if bc and bc.get("totalAverage", {}).get("weight"):
         row["weight"] = bc["totalAverage"]["weight"] / 1000  # g -> kg
@@ -336,13 +387,20 @@ def _need_refresh(entry: dict | None) -> bool:
     return entry is None
 
 
-def download(api: Garmin, start: date, end: date, with_steps: bool = False,
-             with_sleep: bool = False, with_races: bool = False) -> dict:
+def download(
+    api: Garmin,
+    start: date,
+    end: date,
+    with_steps: bool = False,
+    with_sleep: bool = False,
+    with_races: bool = False,
+) -> dict:
     cache = json.loads(CACHE_FILE.read_text()) if CACHE_FILE.exists() else {}
-    total = max(0, (end - start).days)   # la borne 'end' est exclusive
+    total = max(0, (end - start).days)  # la borne 'end' est exclusive
     n = 0
-    with tqdm(total=total, unit="j", desc="Téléchargement",
-              disable=None, dynamic_ncols=True) as bar:
+    with tqdm(
+        total=total, unit="j", desc="Téléchargement", disable=None, dynamic_ncols=True
+    ) as bar:
         bar.set_postfix_str("0 téléchargés")
         d = start
         while d < end:
@@ -365,19 +423,38 @@ def download(api: Garmin, start: date, end: date, with_steps: bool = False,
         # tranches incomplètes sont interrogées, et une valeur déjà connue
         # n'est jamais écrasée.
         for flag, label, days, fetcher, cols, is_missing in (
-            (with_steps, "pas", CHUNK_DAYS, fetch_steps_range, ("steps",),
-             lambda e: e.get("steps") is None),
-            (with_sleep, "sommeil", CHUNK_DAYS, fetch_sleep_range,
-             ("sleep_score", "sleep_hours"),
-             lambda e: e.get("sleep_score") is None or e.get("sleep_hours") is None),
-            (with_races, "prédictions de course", RACE_CHUNK_DAYS,
-             fetch_race_predictions, ("pred_5k", "pred_half"),
-             lambda e: e.get("pred_5k") is None and e.get("pred_half") is None),
+            (
+                with_steps,
+                "pas",
+                CHUNK_DAYS,
+                fetch_steps_range,
+                ("steps",),
+                lambda e: e.get("steps") is None,
+            ),
+            (
+                with_sleep,
+                "sommeil",
+                CHUNK_DAYS,
+                fetch_sleep_range,
+                ("sleep_score", "sleep_hours"),
+                lambda e: e.get("sleep_score") is None or e.get("sleep_hours") is None,
+            ),
+            (
+                with_races,
+                "prédictions de course",
+                RACE_CHUNK_DAYS,
+                fetch_race_predictions,
+                ("pred_5k", "pred_half"),
+                lambda e: e.get("pred_5k") is None and e.get("pred_half") is None,
+            ),
         ):
             if not flag:
                 continue
-            missing = {d.isoformat() for d in _daterange(start, end)
-                       if is_missing(cache.get(d.isoformat(), {}))}
+            missing = {
+                d.isoformat()
+                for d in _daterange(start, end)
+                if is_missing(cache.get(d.isoformat(), {}))
+            }
             if not missing:
                 continue
             bar.set_postfix_str(label)
@@ -404,27 +481,29 @@ def monthly(cache: dict) -> pd.DataFrame:
     # colonnes fixes : un indicateur absent du cache devient NaN (jamais une erreur)
     df = df.reindex(columns=COLS_DAILY).apply(pd.to_numeric, errors="coerce")
     g = df.groupby(df.index.to_period("M"))
-    out = pd.DataFrame({
-        "days": g.size(),
-        "weight": g["weight"].mean(),
-        "rhr": g["rhr"].mean(),
-        "hr_max": g["hr_max"].max(),
-        "bb_max": g["bb_max"].mean(),
-        "VO2max": g["VO2max"].mean(),
-        "max_VO2max": g["VO2max"].max(),
-        "stress": g["stress"].mean(),
-        # min_count=1 : un mois sans aucune mesure vaut NaN (et non 0),
-        # pour ne pas confondre « aucun relevé » et « valeur nulle »
-        "calories": g["calories"].sum(min_count=1),
-        # les pas sont ramenés au jour : la moyenne du mois (pas/j)
-        "steps": g["steps"].mean(),
-        "moderate": g["moderate"].sum(min_count=1),
-        "intense": g["intense"].sum(min_count=1),
-        "sleep_score": g["sleep_score"].mean(),
-        "sleep_hours": g["sleep_hours"].mean(),
-        "pred_5k": g["pred_5k"].mean(),
-        "pred_half": g["pred_half"].mean(),
-    })
+    out = pd.DataFrame(
+        {
+            "days": g.size(),
+            "weight": g["weight"].mean(),
+            "rhr": g["rhr"].mean(),
+            "hr_max": g["hr_max"].max(),
+            "bb_max": g["bb_max"].mean(),
+            "VO2max": g["VO2max"].mean(),
+            "max_VO2max": g["VO2max"].max(),
+            "stress": g["stress"].mean(),
+            # min_count=1 : un mois sans aucune mesure vaut NaN (et non 0),
+            # pour ne pas confondre « aucun relevé » et « valeur nulle »
+            "calories": g["calories"].sum(min_count=1),
+            # les pas sont ramenés au jour : la moyenne du mois (pas/j)
+            "steps": g["steps"].mean(),
+            "moderate": g["moderate"].sum(min_count=1),
+            "intense": g["intense"].sum(min_count=1),
+            "sleep_score": g["sleep_score"].mean(),
+            "sleep_hours": g["sleep_hours"].mean(),
+            "pred_5k": g["pred_5k"].mean(),
+            "pred_half": g["pred_half"].mean(),
+        }
+    )
     out["total"] = out["moderate"] + 2 * out["intense"]
     out.index = out.index.astype(str)
     out.index.name = "month"
@@ -465,8 +544,7 @@ def _daily_frame(cache: dict) -> pd.DataFrame:
     `monthly()`.
     """
     if not cache:
-        return pd.DataFrame(columns=COLS_DAILY + ["total"],
-                            index=pd.DatetimeIndex([]))
+        return pd.DataFrame(columns=[*COLS_DAILY, "total"], index=pd.DatetimeIndex([]))
     df = pd.DataFrame.from_dict(cache, orient="index")
     df.index = pd.to_datetime(df.index)
     df = df.sort_index().apply(pd.to_numeric, errors="coerce")
@@ -548,35 +626,41 @@ def synthese_semaine(cache: dict, jours: int = 7, semaines_ref: int = 12) -> str
         return "  (aucune donnée journalière dans le cache)"
 
     n = min(jours, len(df))
-    week = df.iloc[-n:]                       # la fenêtre observée
-    ref = df.iloc[-(n + semaines_ref * 7):-n]  # la période de référence
+    week = df.iloc[-n:]  # la fenêtre observée
+    ref = df.iloc[-(n + semaines_ref * 7) : -n]  # la période de référence
     n_blocs = len(ref) // 7
-    blocs = [ref.iloc[i:i + 7] for i in range(0, n_blocs * 7, 7)]
+    blocs = [ref.iloc[i : i + 7] for i in range(0, n_blocs * 7, 7)]
 
-    L = [f"=== SYNTHÈSE DE LA SEMAINE ({_date(week.index.min())} → "
-         f"{_date(week.index.max())}) ==="]
-    L.append(f"  Fenêtre : {n} {_pl(n, 'dernier jour', 'derniers jours')} "
-             f"({_date_court(week.index.min())} → {_date_court(week.index.max())})")
+    L = [f"=== SYNTHÈSE DE LA SEMAINE ({_date(week.index.min())} → {_date(week.index.max())}) ==="]
+    L.append(
+        f"  Fenêtre : {n} {_pl(n, 'dernier jour', 'derniers jours')} "
+        f"({_date_court(week.index.min())} → {_date_court(week.index.max())})"
+    )
     if n_blocs:
-        ref_label = ("de la semaine précédente" if n_blocs == 1
-                     else f"des {n_blocs} semaines précédentes")
-        L.append(f"  Référence : moyenne hebdomadaire {ref_label} "
-                 f"({_date_court(ref.index.min())} → {_date_court(ref.index.max())})")
+        ref_label = (
+            "de la semaine précédente" if n_blocs == 1 else f"des {n_blocs} semaines précédentes"
+        )
+        L.append(
+            f"  Référence : moyenne hebdomadaire {ref_label} "
+            f"({_date_court(ref.index.min())} → {_date_court(ref.index.max())})"
+        )
     else:
         L.append("  Référence : pas d'historique suffisant pour comparer")
-    L.append(f"  Couverture : {int((week['calories'] >= MIN_CAL).sum())} j actifs / {n}"
-             f" | poids : {_mesures(int(week['weight'].notna().sum()))}"
-             f" | VO2max : {_mesures(int(week['VO2max'].notna().sum()))}"
-             f" | pas : {_mesures(int(week['steps'].notna().sum()))}"
-             f" | sommeil : {_mesures(int(week['sleep_score'].notna().sum()))}"
-             f" | 5K : {_mesures(int(week['pred_5k'].notna().sum()))}"
-             f" | semi : {_mesures(int(week['pred_half'].notna().sum()))}")
+    L.append(
+        f"  Couverture : {int((week['calories'] >= MIN_CAL).sum())} j actifs / {n}"
+        f" | poids : {_mesures(int(week['weight'].notna().sum()))}"
+        f" | VO2max : {_mesures(int(week['VO2max'].notna().sum()))}"
+        f" | pas : {_mesures(int(week['steps'].notna().sum()))}"
+        f" | sommeil : {_mesures(int(week['sleep_score'].notna().sum()))}"
+        f" | 5K : {_mesures(int(week['pred_5k'].notna().sum()))}"
+        f" | semi : {_mesures(int(week['pred_half'].notna().sum()))}"
+    )
 
     L.append("")
-    L.append("  ACTIVITÉ : cumul de la semaine (pas : moyenne/jour) | "
-             "SANTÉ : moyenne de la semaine")
-    L.append(f"  {'INDICATEUR':<26s}{'SEMAINE':>11s}{'RÉFÉRENCE':>11s}"
-             f"{'ÉCART':>11s}   SENS")
+    L.append(
+        "  ACTIVITÉ : cumul de la semaine (pas : moyenne/jour) | SANTÉ : moyenne de la semaine"
+    )
+    L.append(f"  {'INDICATEUR':<26s}{'SEMAINE':>11s}{'RÉFÉRENCE':>11s}{'ÉCART':>11s}   SENS")
     fav = unfav = n_stable = hors = 0
     non_comparables = []
     wvs, refs = {}, {}
@@ -593,18 +677,22 @@ def synthese_semaine(cache: dict, jours: int = 7, semaines_ref: int = 12) -> str
         d = wv - rv
         d_r = _ecart_affiche(d, dec, fmt)
         if d_r == 0:
-            d_r = 0.0   # normalise -0.0 (sinon on afficherait « +-0 »)
+            d_r = 0.0  # normalise -0.0 (sinon on afficherait « +-0 »)
         # comparable : assez de mesures des deux côtés
         comparable = bool(nw >= 2 and nr >= 5 and not pd.isna(d))
         # hors de la plage des semaines de référence ?
         # (3 blocs minimum : en dessous, la plage est trop poorre pour conclure)
-        hors_plage = bool(comparable and n_blocs >= 3 and bv
-                          and (wv < min(bv) or wv > max(bv)))
+        hors_plage = bool(comparable and n_blocs >= 3 and bv and (wv < min(bv) or wv > max(bv)))
         sens = "—"
         if comparable and c in SENS:
             # le sens est celui de l'écart arrondi : un écart nul est « stable »
-            sens = ("favorable" if d_r * SENS[c] > 0
-                    else "défavorable" if d_r * SENS[c] < 0 else "stable")
+            sens = (
+                "favorable"
+                if d_r * SENS[c] > 0
+                else "défavorable"
+                if d_r * SENS[c] < 0
+                else "stable"
+            )
             fav += 1 if sens == "favorable" else 0
             unfav += 1 if sens == "défavorable" else 0
             n_stable += 1 if sens == "stable" else 0
@@ -614,8 +702,10 @@ def synthese_semaine(cache: dict, jours: int = 7, semaines_ref: int = 12) -> str
         if c in SENS and not comparable:
             non_comparables.append(f"{lab.split(' (')[0]} ({_mesures(nw)})")
         wvs[c], refs[c] = wv, rv
-        L.append(f"  {lab:<26s}{_fmt(wv, dec, fmt):>11s}{_fmt(rv, dec, fmt):>11s}"
-                 f"{_fmt_ecart(d, dec, fmt):>11s}   {sens}")
+        L.append(
+            f"  {lab:<26s}{_fmt(wv, dec, fmt):>11s}{_fmt(rv, dec, fmt):>11s}"
+            f"{_fmt_ecart(d, dec, fmt):>11s}   {sens}"
+        )
 
     if non_comparables and n_blocs:
         L.append("")
@@ -626,20 +716,23 @@ def synthese_semaine(cache: dict, jours: int = 7, semaines_ref: int = 12) -> str
     L.append("  VERDICT")
     n_comp = fav + unfav + n_stable
     if n_comp:
-        L.append(f"    Santé : {fav} en amélioration, {unfav} en dégradation, "
-                 f"{n_stable} {_pl(n_stable, 'stable', 'stables')} "
-                 f"(sur {n_comp} comparables).")
+        L.append(
+            f"    Santé : {fav} en amélioration, {unfav} en dégradation, "
+            f"{n_stable} {_pl(n_stable, 'stable', 'stables')} "
+            f"(sur {n_comp} comparables)."
+        )
     else:
         L.append("    Santé : aucun indicateur comparable sur la période.")
     if n_blocs:
         dt = wvs["total"] - refs["total"]
-        seuil = n          # 1 min/j d'écart = seuil de « stable »
+        seuil = n  # 1 min/j d'écart = seuil de « stable »
         tend = "en hausse" if dt > seuil else "en baisse" if dt < -seuil else "stable"
-        L.append(f"    Activité : charge pondérée {tend} "
-                 f"({dt:+.0f} min/sem vs référence).")
+        L.append(f"    Activité : charge pondérée {tend} ({dt:+.0f} min/sem vs référence).")
         if hors:
-            L.append(f"    {hors} écart(s) hors de la plage des {n_blocs} dernières "
-                     f"{_pl(n_blocs, 'semaine')}.")
+            L.append(
+                f"    {hors} écart(s) hors de la plage des {n_blocs} dernières "
+                f"{_pl(n_blocs, 'semaine')}."
+            )
     L.append("    Semaine isolée : à lire comme un instantané, pas comme une tendance.")
     return "\n".join(L)
 
@@ -649,19 +742,28 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--start", default="2020-08-01")
     p.add_argument("--end", default=date.today().isoformat())
-    p.add_argument("--steps", action="store_true",
-                   help="récupère aussi le nombre de pas quotidiens "
-                        "(1 appel API par tranche de 28 jours)")
-    p.add_argument("--sleep", action="store_true",
-                   help="récupère aussi le score et la durée du sommeil "
-                        "(1 appel API par tranche de 28 jours)")
-    p.add_argument("--races", action="store_true",
-                   help="récupère aussi les prédictions de course (5K, semi-marathon) "
-                        "(1 appel API par tranche d'année)")
-    p.add_argument("--all", action="store_true",
-                   help="récupère tous les indicateurs optionnels (pas, sommeil, courses)")
-    p.add_argument("--verbose", action="store_true",
-                   help="journalise les erreurs d'appel API")
+    p.add_argument(
+        "--steps",
+        action="store_true",
+        help="récupère aussi le nombre de pas quotidiens (1 appel API par tranche de 28 jours)",
+    )
+    p.add_argument(
+        "--sleep",
+        action="store_true",
+        help="récupère aussi le score et la durée du sommeil (1 appel API par tranche de 28 jours)",
+    )
+    p.add_argument(
+        "--races",
+        action="store_true",
+        help="récupère aussi les prédictions de course (5K, semi-marathon) "
+        "(1 appel API par tranche d'année)",
+    )
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="récupère tous les indicateurs optionnels (pas, sommeil, courses)",
+    )
+    p.add_argument("--verbose", action="store_true", help="journalise les erreurs d'appel API")
     a = p.parse_args()
     start = datetime.strptime(a.start, "%Y-%m-%d").date()
     end = datetime.strptime(a.end, "%Y-%m-%d").date()
@@ -669,10 +771,14 @@ def main():
 
     api = login()
     print("Connecté. Téléchargement (long la première fois, ensuite en cache)...")
-    cache = download(api, start, end,
-                     with_steps=a.steps or a.all,
-                     with_sleep=a.sleep or a.all,
-                     with_races=a.races or a.all)
+    cache = download(
+        api,
+        start,
+        end,
+        with_steps=a.steps or a.all,
+        with_sleep=a.sleep or a.all,
+        with_races=a.races or a.all,
+    )
     table = display_table(monthly(cache))
     table.to_csv("history.csv", index=False)
     table.to_excel("activity.xlsx", index=False)
