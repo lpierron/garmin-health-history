@@ -45,6 +45,7 @@ from matplotlib.colors import LinearSegmentedColormap
 from scipy import stats
 
 from analysis import bh_fdr  # correction FDR déjà écrite dans analysis.py
+from units import fmt_hm, fmt_hms
 
 # ------------------------------------------------------------ vocabulaire
 ACT_LABEL = {
@@ -54,7 +55,7 @@ ACT_LABEL = {
     "calories": "Calories actives",
     "load7": "Charge 7 jours",
     "load4w": "Charge 4 semaines",
-    "steps": "Pas",
+    "steps": "Pas/j",
 }
 HEALTH_LABEL = {
     "rhr": "FC repos",
@@ -71,6 +72,8 @@ UNITS = {"rhr": "bpm", "stress": "pts", "bb_max": "pts", "weight": "kg", "VO2max
          "total": "min/j", "moderate": "min/j", "intense": "min/j", "calories": "kcal/j",
          "steps": "pas", "sleep_score": "pts", "sleep_hours": "h",
          "pred_5k": "min", "pred_half": "min"}
+# indicateurs affichés comme une durée : sommeil « hh:mm », prédictions « hh:mm:ss »
+DUREES = {"sleep_hours": "hm", "pred_5k": "hms", "pred_half": "hms"}
 GOOD = {"rhr": -1, "stress": -1, "bb_max": +1, "weight": -1, "VO2max": +1,
         "sleep_score": +1, "sleep_hours": +1,
         "pred_5k": -1, "pred_half": -1}
@@ -81,6 +84,14 @@ WEEKLY_HEALTH = ["rhr", "stress", "bb_max", "weight", "VO2max", "sleep_score",
                  "sleep_hours", "pred_5k", "pred_half"]
 MONTHS = ["janv.", "févr.", "mars", "avr.", "mai", "juin",
           "juil.", "août", "sept.", "oct.", "nov.", "déc."]
+# colonnes attendues dans le cache journalier : un indicateur absent devient
+# une colonne vide (NaN) au lieu de faire échouer le script
+COLS = ["rhr", "hr_max", "stress", "bb_max", "calories", "moderate", "intense",
+        "weight", "VO2max", "steps", "sleep_score", "sleep_hours",
+        "pred_5k", "pred_half"]
+# nombre minimal de paires pour qu'une corrélation ait un sens
+MIN_PAIRS_WEEKLY = 40
+MIN_PAIRS_DAILY = 200
 
 # palette de référence (dataviz) : divergent bleu <-> gris <-> rouge
 SURF, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#dcdbd6"
@@ -93,6 +104,8 @@ def load_daily(path: Path, min_cal: float):
     raw = json.loads(path.read_text(encoding="utf-8"))
     df = pd.DataFrame.from_dict(raw, orient="index")
     df.index = pd.to_datetime(df.index)
+    # colonnes fixes : un indicateur absent du cache reste une colonne vide
+    df = df.reindex(columns=COLS)
     df = df.sort_index().apply(pd.to_numeric, errors="coerce").asfreq("D")
     df = df.iloc[:-1]  # dernier jour du cache : souvent incomplet
     df["total"] = df["moderate"] + 2 * df["intense"]
@@ -131,6 +144,8 @@ def _basis(index: pd.DatetimeIndex, weekday: bool, K: int, knot_days: int):
 
 def deseason(s: pd.Series, weekday=False, K=2, knot_days=365):
     """Retourne (résidus, info saisonnière)."""
+    if len(s) == 0:
+        return s * np.nan, None
     X, n_tr, n_h = _basis(s.index, weekday, K, knot_days)
     y = s.values.astype(float)
     m = ~np.isnan(y)
@@ -194,6 +209,8 @@ def trend_table(weekly_raw: pd.DataFrame, cols, n_boot, rng, block=13):
     """Pente de Theil-Sen par an + IC95% par bootstrap par blocs (13 semaines)."""
     rows = []
     for c in cols:
+        if c not in weekly_raw.columns:
+            continue  # indicateur absent des données
         y = weekly_raw[c].values.astype(float)
         t = np.arange(len(y)) / 52.1775
         m = ~np.isnan(y)
@@ -230,6 +247,16 @@ def tercile_contrast(act_adj: pd.Series, hl_adj: dict, lag=1):
 
 
 # ------------------------------------------------------------------ figures
+def _fmt_duree(c: str, v, signed: bool = False) -> str:
+    """Formate une valeur selon l'unité de l'indicateur (durée ou nombre)."""
+    fmt = DUREES.get(c)
+    if fmt == "hm":
+        return fmt_hm(v, signed=signed)
+    if fmt == "hms":
+        return fmt_hms(v, signed=signed)
+    return f"{v:.1f}"
+
+
 def _style():
     plt.rcParams.update({
         "figure.facecolor": SURF, "axes.facecolor": SURF, "savefig.facecolor": SURF,
@@ -241,7 +268,10 @@ def _style():
 
 def heat_panels(corr, scale, lags, acts, health, lag_unit, title, path):
     _style()
-    fig, axes = plt.subplots(1, len(lags), figsize=(3.6 * len(lags) + 1.6, 3.9), sharey=True)
+    # la largeur d'un panneau suit le nombre d'indicateurs : sinon les
+    # valeurs se chevauchent quand la grille s'élargit
+    w = max(3.6, 0.62 * len(health))
+    fig, axes = plt.subplots(1, len(lags), figsize=(w * len(lags) + 1.6, 3.9), sharey=True)
     axes = np.atleast_1d(axes)
     for ax, lag in zip(axes, lags):
         sub = corr[(corr.scale == scale) & (corr.lag == lag)]
@@ -260,7 +290,8 @@ def heat_panels(corr, scale, lags, acts, health, lag_unit, title, path):
                 if np.isnan(v):
                     continue
                 mark = "*" if qq < 0.05 else ("+" if qq < 0.10 else "")
-                ax.text(j, i, f"{v:+.2f}{mark}", ha="center", va="center", fontsize=8.5, color=INK)
+                ax.text(j, i, f"{v:+.2f}{mark}", ha="center", va="center",
+                        fontsize=8 if len(health) > 7 else 8.5, color=INK)
     cb = fig.colorbar(im, ax=axes, shrink=0.8, pad=0.02)
     cb.set_label("tau de Kendall (écarts corrigés)", color=INK2)
     cb.outline.set_visible(False)
@@ -272,16 +303,27 @@ def heat_panels(corr, scale, lags, acts, health, lag_unit, title, path):
 
 def seasonality_figure(weekly_raw, path):
     _style()
-    cols = ["rhr", "stress", "bb_max", "weight", "VO2max", "total"]
-    names = {**HEALTH_LABEL, "total": "Activité (total pondéré)"}
+    cols = [c for c in ["rhr", "stress", "bb_max", "weight", "VO2max", "total"]
+            if c in weekly_raw.columns and weekly_raw[c].notna().any()]
+    if not cols:
+        return
+    names = {**HEALTH_LABEL, "total": "Activité (total pondéré)", "steps": "Pas"}
     fig, axes = plt.subplots(2, 3, figsize=(10.5, 5.6), sharex=True)
-    for ax, c in zip(axes.ravel(), cols):
+    axes = np.atleast_1d(axes).ravel()
+    for ax in axes[len(cols):]:
+        ax.set_visible(False)
+    for ax, c in zip(axes, cols):
         s = weekly_raw[c]
         piv = s.groupby([s.index.year, s.index.month]).mean().unstack(0)
         for yr in piv.columns:
             ax.plot(piv.index, piv[yr], color=GRID, lw=1)
         ax.plot(piv.index, piv.mean(axis=1), color=BLUE, lw=2)
-        ax.set_title(f"{names[c]} ({UNITS[c]})", loc="left")
+        title = names[c]
+        if c == "steps":
+            title += " (pas/j)"
+        elif c not in DUREES:
+            title += f" ({UNITS[c]})"
+        ax.set_title(title, loc="left")
         ax.grid(axis="y", color=GRID, lw=0.6)
         ax.set_xticks(range(1, 13), [m[0].upper() for m in MONTHS])
         ax.tick_params(length=0)
@@ -362,37 +404,63 @@ def main():
                 if c in daily.columns]
     cov = (daily[cov_cols].notna().mean() * 100).round(0)
     print("Couverture journalière : " + ", ".join(f"{k} {int(v)} %" for k, v in cov.items()))
+    # indicateurs présents mais totalement vides (ex. pas encore récupérés)
+    vides = [c for c in cov_cols if int(daily[c].notna().sum()) == 0]
+    if vides:
+        print("Données indisponibles : "
+              + ", ".join(HEALTH_LABEL.get(c) or ACT_LABEL.get(c, c) for c in vides))
+    # indicateurs trop peu fournis pour être corrélés : il faut au moins
+    # MIN_PAIRS_DAILY mesures journalières (l'échelle la plus permissive)
+    trop_peu = [c for c in cov_cols if 0 < int(daily[c].notna().sum()) < MIN_PAIRS_DAILY]
+    if trop_peu:
+        print(f"Trop peu de données pour les corrélations "
+              f"(< {MIN_PAIRS_DAILY} mesures) : "
+              + ", ".join(HEALTH_LABEL.get(c) or ACT_LABEL.get(c, c) for c in trop_peu))
+    # colonnes réellement exploitables (présentes ET non vides)
+    d_act = [c for c in DAILY_ACT if c in daily.columns and daily[c].notna().any()]
+    d_hl = [c for c in DAILY_HEALTH if c in daily.columns and daily[c].notna().any()]
+    w_act = [c for c in WEEKLY_ACT if c in weekly.columns and weekly[c].notna().any()]
+    w_hl = [c for c in WEEKLY_HEALTH if c in weekly.columns and weekly[c].notna().any()]
 
     # --- correction
     def adjust(df, weekday, cols):
         raw, adj, info = {}, {}, {}
         for c in cols:
+            if c not in df.columns:
+                continue  # indicateur absent des données
             raw[c] = df[c]
             adj[c], info[c] = deseason(df[c], weekday=weekday)
         return raw, adj, info
 
-    d_cols = sorted(set(DAILY_ACT + DAILY_HEALTH))
-    w_cols = sorted(set(WEEKLY_ACT + WEEKLY_HEALTH))
+    d_cols = sorted(set(d_act + d_hl))
+    w_cols = sorted(set(w_act + w_hl))
     d_raw, d_adj, _ = adjust(daily, True, d_cols)
     w_raw, w_adj, w_info = adjust(weekly, False, w_cols)
-    seas_cols = ["rhr", "stress", "bb_max", "weight", "VO2max", "total", "intense",
-                 "calories", "steps", "sleep_score", "sleep_hours", "pred_5k", "pred_half"]
+    seas_cols = [c for c in ["rhr", "stress", "bb_max", "weight", "VO2max", "total", "intense",
+                             "calories", "steps", "sleep_score", "sleep_hours",
+                             "pred_5k", "pred_half"]
+                 if c in weekly.columns]
     _, _, seas_info = adjust(weekly, False, seas_cols)
 
     # --- 1. saisonnalité
     print("\n=== 1. SAISONNALITÉ (hebdomadaire, après retrait de la tendance) ===")
-    print(f"  {'':18s}{'amplitude':>14s}  {'pic':>6s}  {'creux':>6s}  part de variance")
+    print(f"  {'':24s}{'amplitude':>14s}  {'pic':>6s}  {'creux':>6s}  part de variance")
     for c in seas_cols:
         i = seas_info.get(c)
         if i is None:
             continue
         name = HEALTH_LABEL.get(c) or ACT_LABEL.get(c)
-        print(f"  {name:18s}{i['amp']:9.1f} {UNITS[c]:<6s}{MONTHS[i['peak'] - 1]:>7s}{MONTHS[i['trough'] - 1]:>8s}"
+        # l'unité est déjà dans le libellé pour les pas (« Pas/j ») et
+        # implicite pour les durées (« hh:mm », « hh:mm:ss »)
+        unit = "" if (c in DUREES or c == "steps") else UNITS[c]
+        print(f"  {name:24s}{_fmt_duree(c, i['amp']):>9s} {unit:<6s}"
+              f"{MONTHS[i['peak'] - 1]:>7s}{MONTHS[i['trough'] - 1]:>8s}"
               f"   {i['share'] * 100:4.0f} %")
 
     # --- 2. tendances
     print("\n=== 2. TENDANCES DE FOND (pente de Theil-Sen / an, IC95 % bootstrap par blocs) ===")
-    tr = trend_table(weekly, WEEKLY_HEALTH + ["total", "intense", "calories", "steps"],
+    tr = trend_table(weekly, w_hl + [c for c in ["total", "intense", "calories", "steps"]
+                                     if c in weekly.columns],
                      a.boot, rng)
     for _, r in tr.iterrows():
         name = HEALTH_LABEL.get(r.variable) or ACT_LABEL[r.variable]
@@ -402,12 +470,14 @@ def main():
 
     # --- 3/4. corrélations
     print(f"\n(calcul des p-values : {a.shifts} substitutions circulaires par paire...)")
-    cw = correlate("weekly", {c: w_raw[c] for c in WEEKLY_ACT}, {c: w_adj[c] for c in WEEKLY_ACT},
-                   {c: w_raw[c] for c in WEEKLY_HEALTH}, {c: w_adj[c] for c in WEEKLY_HEALTH},
-                   lags=(0, 1, 2), min_shift=8, n_shifts=a.shifts, rng=rng, min_pairs=40)
-    cd = correlate("daily", {c: d_raw[c] for c in DAILY_ACT}, {c: d_adj[c] for c in DAILY_ACT},
-                   {c: d_raw[c] for c in DAILY_HEALTH}, {c: d_adj[c] for c in DAILY_HEALTH},
-                   lags=(0, 1), min_shift=30, n_shifts=a.shifts, rng=rng, min_pairs=200)
+    cw = correlate("weekly", {c: w_raw[c] for c in w_act}, {c: w_adj[c] for c in w_act},
+                   {c: w_raw[c] for c in w_hl}, {c: w_adj[c] for c in w_hl},
+                   lags=(0, 1, 2), min_shift=8, n_shifts=a.shifts, rng=rng,
+                   min_pairs=MIN_PAIRS_WEEKLY)
+    cd = correlate("daily", {c: d_raw[c] for c in d_act}, {c: d_adj[c] for c in d_act},
+                   {c: d_raw[c] for c in d_hl}, {c: d_adj[c] for c in d_hl},
+                   lags=(0, 1), min_shift=30, n_shifts=a.shifts, rng=rng,
+                   min_pairs=MIN_PAIRS_DAILY)
     corr = pd.concat([cw, cd], ignore_index=True)
     corr.to_csv(a.out / "correlations_fine.csv", index=False)
 
@@ -429,10 +499,13 @@ def main():
     # --- 6. dose-réponse hebdo
     print("\n=== 6. SEMAINES TRÈS ACTIVES vs PEU ACTIVES → santé de la semaine suivante ===")
     print("  (écarts corrigés ; médiane du tiers le plus actif moins celle du tiers le moins actif)")
-    terc = tercile_contrast(w_adj["total"], {h: w_adj[h] for h in WEEKLY_HEALTH}, lag=1)
+    terc = tercile_contrast(w_adj["total"], {h: w_adj[h] for h in w_hl}, lag=1)
     for _, r in terc.iterrows():
-        print(f"  {HEALTH_LABEL[r.health]:17s} écart {r['diff']:+6.2f} {UNITS[r.health]:<9s} "
-              f"(p={r.p:.3f}, n={int(r.n_low)}/{int(r.n_high)})  [{verdict(r.health, r['diff'])}]")
+        unit = "" if r.health in DUREES else UNITS[r.health]
+        print(f"  {HEALTH_LABEL[r.health]:24s} écart "
+              f"{_fmt_duree(r.health, r['diff'], signed=True):>9s} {unit:<9s} "
+              f"(p={r.p:.3f}, n={int(r.n_low)}/{int(r.n_high)})  "
+              f"[{verdict(r.health, r['diff'])}]")
     print("  p-values de cette section : naïves (semaines supposées indépendantes) → indicatives.")
 
     # --- limites
@@ -446,9 +519,9 @@ def main():
     print("  * ~100 paires testées : quelques résultats « limites » (q entre 0.05 et 0.10) sont attendus par hasard.")
 
     # --- figures
-    heat_panels(corr, "weekly", (0, 1, 2), WEEKLY_ACT, WEEKLY_HEALTH, "sem.",
+    heat_panels(corr, "weekly", (0, 1, 2), w_act, w_hl, "sem.",
                 "Activité hebdomadaire vs santé (corrigé saison + tendance)", a.out / "correlations_weekly.png")
-    heat_panels(corr, "daily", (0, 1), DAILY_ACT, DAILY_HEALTH, "jour",
+    heat_panels(corr, "daily", (0, 1), d_act, d_hl, "jour",
                 "Activité journalière vs santé (corrigé saison + tendance + jour de semaine)",
                 a.out / "correlations_daily.png")
     seasonality_figure(weekly, a.out / "seasonality.png")

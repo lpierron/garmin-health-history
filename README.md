@@ -52,12 +52,40 @@ After the first successful login, session tokens are cached in
 ```sh
 python history.py --start 2020-08-01
 python history.py --start 2024-01-01 --end 2026-10-15
+python history.py --start 2020-08-01 --all      # + pas, sommeil, prédictions de course
 ```
 
-| Option    | Default      | Description             |
-| --------- | ------------ | ----------------------- |
-| `--start` | `2020-08-01` | Start date (YYYY-MM-DD) |
-| `--end`   | today        | End date (YYYY-MM-DD)   |
+| Option     | Default      | Description                                            |
+| ---------- | ------------ | ------------------------------------------------------ |
+| `--start`  | `2020-08-01` | Start date (YYYY-MM-DD)                                |
+| `--end`    | today        | End date (YYYY-MM-DD) — **exclusive**                  |
+| `--steps`  | off          | Also fetch the daily step count                        |
+| `--sleep`  | off          | Also fetch the sleep score and duration                |
+| `--races`  | off          | Also fetch the 5K / half-marathon race predictions     |
+| `--all`    | off          | Fetch every optional indicator (`--steps --sleep --races`) |
+| `--verbose` | off         | Log API failures (they are otherwise ignored)          |
+
+The optional indicators are fetched in **date ranges** rather than day by day
+(1 API call per 28 days for steps and sleep, 1 per 365 days for the race
+predictions), so a full backfill costs a few hundred calls instead of one per
+day. Only the missing days are requested, and a value already in the cache is
+never overwritten.
+
+## Data availability
+
+Garmin does not expose every indicator over the whole history — the coverage
+depends on the device, its firmware and when the data was synced:
+
+| Indicator                              | Source                       | Typically available from |
+| -------------------------------------- | ---------------------------- | ------------------------ |
+| Daily stats, VO2max, weight            | one call per day             | start of the history     |
+| Steps                                   | `stats/steps/daily`          | first days with data     |
+| Sleep duration                         | `sleep/daily`                | ~2018-06 (with holes)    |
+| Sleep score                            | `sleep/daily`                | ~2026-06 (device-dependent) |
+| 5K / half-marathon race predictions    | `racepredictions`            | ~2023-02                 |
+
+Indicators that are missing are simply empty columns: the scripts never fail
+because of them, and `analysis_fine.py` lists them as *Données indisponibles*.
 
 ## Output
 
@@ -69,9 +97,29 @@ Two files are written in the current directory:
 Both contain one row per month with these columns:
 
 `month`, `days`, `weight`, `rhr`, `hr_max`, `bb_max`, `VO2max`, `max_VO2max`,
-`stress`, `calories`, `moderate`, `intense`, `total`
+`stress`, `calories`, `steps`, `moderate`, `intense`, `sleep_score`,
+`sleep_hours`, `pred_5k`, `pred_half`, `total`
 
 where `total = moderate + 2 * intense`.
+
+### Units
+
+| Column                          | Unit                        | Example      |
+| ------------------------------- | --------------------------- | ------------ |
+| `steps`                         | steps per day (pas/j)       | `9075`       |
+| `moderate`, `intense`, `total`  | minutes per month           | `540`        |
+| `calories`                      | kcal per month              | `8003`       |
+| `sleep_hours`                   | `hh:mm`                     | `08:14`      |
+| `pred_5k`, `pred_half`          | `hh:mm:ss`                  | `00:31:35`   |
+| `sleep_score`                   | points (0-100)              | `79.6`       |
+| `weight`                        | kg                          | `89.4`       |
+| `VO2max`                        | ml/kg/min                   | `39.9`       |
+| `rhr`, `hr_max`                 | bpm                         | `47.8`       |
+
+Durations are written in their readable form (`hh:mm`, `hh:mm:ss`); the
+analysis scripts read them back as numbers, so `history.csv` stays the single
+source of truth. A month with no measurement for an indicator is left empty
+(not zero), so "no reading" is never mistaken for "value of zero".
 
 ### Weekly synthesis
 
@@ -80,7 +128,9 @@ After the last six months, the script prints a synthesis of the **last 7 days**
 
 - activity (moderate, intense, weighted total, active calories) summed over the
   week, as in `history.csv`, and health indicators (resting HR, max HR, stress,
-  Body Battery, VO2max, weight) averaged over the week;
+  Body Battery, VO2max, weight) averaged over the week; the step count is
+  averaged over the week (pas/j) and the durations (sleep, race predictions)
+  are shown as `hh:mm` / `hh:mm:ss`;
 - the gap to the reference period (the weekly average of the 12 previous weeks)
   for each indicator, with a favourable/unfavourable reading for the health
   indicators;
@@ -96,9 +146,14 @@ being interpreted.
 - Daily data is cached in `garmin_daily_cache.json`; already-fetched days are not
   downloaded again. The last 3 days are always refreshed since their data may be
   incomplete.
+- A failed API call never erases a cached value: a day is only updated with the
+  fields the API actually returned.
+- Optional indicators are fetched by date range and merged into the cache, only
+  where a value is missing.
 - A progress bar tracks the download; it is hidden automatically when the output
   is not a terminal.
 - A short delay between requests is applied to be gentle on Garmin's servers.
+- `--verbose` logs the API errors that are otherwise ignored.
 
 The generated files (`history.csv`, `activity.xlsx`), the cache, and session
 tokens are all gitignored.
@@ -115,9 +170,10 @@ Reads `history.csv` and reports:
 - **Trends**: Kendall tau of each indicator against time, with a Theil-Sen
   slope per year.
 - **Correlations**: Kendall tau-b between activity (moderate, intense,
-  weighted total, active calories) and health, same month and with a one-month
-  lag (does activity in month M relate to health in M+1?). Activity columns are
-  divided by `days` so months of different lengths are comparable.
+  weighted total, active calories, steps) and health, same month and with a
+  one-month lag (does activity in month M relate to health in M+1?). Activity
+  columns are divided by `days` so months of different lengths are comparable
+  (the step count is already a per-day average).
 - **Multiple testing**: p-values are corrected with Benjamini-Hochberg (FDR);
   the report prints q-values and flags `*` when q < 0.05.
 - **Contrast**: median health of the next month for the most active third vs
@@ -170,22 +226,34 @@ p-values are optimistic; few points (n≈12–60 months) also means low
 statistical power. Prefer effects that are consistent across several
 indicators.
 
+An indicator that is absent from the data (never fetched, or not available
+for that period) is skipped and reported as *Données indisponibles* — it never
+aborts the analysis.
+
 Both scripts need the extra dependencies `scipy` and `matplotlib` (already in
 `pyproject.toml`).
 
 ## Continuous integration
 
 A GitHub Actions workflow (`.github/workflows/ci.yml`) installs the
-dependencies with `uv`, checks that the scripts compile and import, and runs
-both analysis scripts on synthetic data generated by `tests/make_fixtures.py`.
-No personal Garmin data is needed to run the CI.
+dependencies with `uv`, checks that the scripts compile and import, runs the
+unit tests, and runs both analysis scripts on synthetic data generated by
+`tests/make_fixtures.py`. The same scripts are also run on a *partial* cache
+(no steps, no sleep, no race predictions) to make sure a missing indicator
+never breaks them. No personal Garmin data is needed to run the CI.
 
 The same smoke test can be run locally:
 
 ```sh
+uv run python -m unittest discover -s tests
 uv run python tests/make_fixtures.py --out fixtures
 uv run python analysis.py --csv fixtures/history.csv --out out
 uv run python analysis_fine.py --cache fixtures/garmin_daily_cache.json --out out
+
+# cache sans les indicateurs optionnels
+uv run python tests/make_fixtures.py --out fixtures-partial --partial
+uv run python analysis.py --csv fixtures-partial/history.csv --out out-partial
+uv run python analysis_fine.py --cache fixtures-partial/garmin_daily_cache.json --out out-partial
 ```
 
 ## License

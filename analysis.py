@@ -27,13 +27,15 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from units import fmt_hm, fmt_hms, parse_hm, parse_hms
+
 # activité (ramenée par jour, car les mois n'ont pas la même durée)
 ACTIVITY = {
     "moderate": "Activité modérée (min/j)",
     "intense": "Activité intense (min/j)",
     "total": "Total pondéré (min/j)",
     "calories": "Calories actives (kcal/j)",
-    "steps": "Pas (nb/j)",
+    "steps": "Pas (pas/j)",
 }
 # indicateurs de santé / forme
 HEALTH = {
@@ -43,7 +45,7 @@ HEALTH = {
     "stress": "Stress",
     "bb_max": "Body Battery max",
     "sleep_score": "Score sommeil",
-    "sleep_hours": "Sommeil (h)",
+    "sleep_hours": "Sommeil",
     "pred_5k": "Prédiction 5K",
     "pred_half": "Prédiction semi-marathon",
 }
@@ -52,13 +54,51 @@ GOOD_DIRECTION = {"rhr": -1, "VO2max": +1, "weight": -1, "stress": -1, "bb_max":
                   "sleep_score": +1, "sleep_hours": +1,
                   "pred_5k": -1, "pred_half": -1}
 MIN_PAIRS = 12  # en dessous, une corrélation n'a pas de sens
+# colonnes attendues dans history.csv : un indicateur absent devient une
+# colonne vide (NaN) au lieu de faire échouer le script
+COLS = sorted(set(ACTIVITY) | set(HEALTH))
+# colonnes déjà exprimées par jour dans history.csv (pas de division par « days »)
+DEJA_PAR_JOUR = {"steps"}
+# indicateurs dont la valeur s'affiche comme une durée
+DUREES = {"sleep_hours": "hm", "pred_5k": "hms", "pred_half": "hms"}
+
+
+def _fmt_val(h: str, v) -> str:
+    """Formate une valeur de santé selon son unité."""
+    fmt = DUREES.get(h)
+    if fmt == "hm":
+        return fmt_hm(v) or "-"
+    if fmt == "hms":
+        return fmt_hms(v) or "-"
+    return f"{v:.1f}"
+
+
+def _fmt_diff(h: str, v) -> str:
+    """Formate un écart signé selon l'unité de l'indicateur."""
+    fmt = DUREES.get(h)
+    if fmt == "hm":
+        return fmt_hm(v, signed=True)
+    if fmt == "hms":
+        return fmt_hms(v, signed=True)
+    return f"{v:+.1f}"
 
 
 # ----------------------------------------------------------------- données
 def load(path: Path, min_days: int) -> pd.DataFrame:
     df = pd.read_csv(path)
+    if "month" not in df.columns:
+        raise SystemExit(f"{path} : colonne 'month' manquante.")
+    if "days" not in df.columns:
+        raise SystemExit(f"{path} : colonne 'days' manquante.")
     df["month"] = pd.PeriodIndex(df["month"], freq="M")
     df = df.sort_values("month").set_index("month")
+    # colonnes fixes : les indicateurs absents du CSV restent des colonnes vides
+    df = df.reindex(columns=["days"] + COLS)
+    # les durées sont écrites « hh:mm » / « hh:mm:ss » : on les relit en nombre
+    for c, conv in (("sleep_hours", parse_hm), ("pred_5k", parse_hms),
+                    ("pred_half", parse_hms)):
+        if c in df.columns:
+            df[c] = df[c].map(conv)
     n0 = len(df)
     df = df[df["days"] >= min_days]  # mois partiel (en cours) exclu
     if len(df) < n0:
@@ -67,7 +107,8 @@ def load(path: Path, min_days: int) -> pd.DataFrame:
     full = pd.period_range(df.index.min(), df.index.max(), freq="M")
     df = df.reindex(full)
     for c in ACTIVITY:
-        if c in df:
+        # « steps » est déjà un pas/jour, les autres sont des cumuls mensuels
+        if c in df and c not in DEJA_PAR_JOUR:
             df[c] = df[c] / df["days"]
     return df
 
@@ -113,8 +154,8 @@ def trends(df: pd.DataFrame) -> pd.DataFrame:
         if h not in df:
             continue
         d = pd.concat([t, df[h]], axis=1).dropna()
-        if len(d) < MIN_PAIRS:
-            continue
+        if len(d) < MIN_PAIRS or d.iloc[:, 1].nunique() < 3:
+            continue  # pas assez de points, ou série constante : rien à dire
         tau, p = stats.kendalltau(d.iloc[:, 0], d.iloc[:, 1])
         slope = stats.theilslopes(d.iloc[:, 1], d.iloc[:, 0])[0] * 12  # par an
         rows.append(dict(variable=h, tau=tau, p=p, slope_per_year=slope, n=len(d)))
@@ -123,10 +164,14 @@ def trends(df: pd.DataFrame) -> pd.DataFrame:
 
 def tercile_contrast(df: pd.DataFrame, activity="total") -> pd.DataFrame:
     """Santé du mois suivant : tiers le plus actif vs tiers le moins actif."""
+    if activity not in df:
+        return pd.DataFrame()
     a = df[activity]
     lo, hi = a.quantile([1 / 3, 2 / 3])
     rows = []
     for h in HEALTH:
+        if h not in df:
+            continue  # indicateur absent du CSV : rien à comparer
         nxt = df[h].shift(-1)
         low = nxt[a <= lo].dropna()
         high = nxt[a >= hi].dropna()
@@ -194,8 +239,9 @@ def report(df, corr, trend, terc, alpha):
     if not terc.empty:
         print("\n--- 3. MOIS TRÈS ACTIFS vs PEU ACTIFS → santé du mois suivant (médianes) ---")
         for _, r in terc.iterrows():
-            print(f"  {HEALTH[r.health]:16s} peu actif {r.low_median:7.1f} | très actif "
-                  f"{r.high_median:7.1f} | écart {r['diff']:+.1f}  (p={r.p:.3f})")
+            print(f"  {HEALTH[r.health]:16s} peu actif {_fmt_val(r.health, r.low_median):>8s} | "
+                  f"très actif {_fmt_val(r.health, r.high_median):>8s} | "
+                  f"écart {_fmt_diff(r.health, r['diff'])}  (p={r.p:.3f})")
 
     print("\n--- LIMITES ---")
     print("  * Corrélation ≠ causalité : un mois très actif peut aussi être un mois en forme,")

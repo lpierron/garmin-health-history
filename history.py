@@ -3,7 +3,8 @@
 Télécharge l'historique Garmin Connect et produit un tableau mensuel
 (history.csv + activity.xlsx) avec les colonnes utilisées par votre analyse :
 month, days, weight, rhr, hr_max, bb_max, VO2max, max_VO2max, stress,
-calories, moderate, intense, total (= moderate + 2 * intense).
+calories, steps, moderate, intense, sleep_score, sleep_hours, pred_5k,
+pred_half, total (= moderate + 2 * intense).
 
 Installation :
     pip install garminconnect pandas openpyxl python-dotenv tqdm
@@ -19,13 +20,19 @@ Identifiants (jamais écrits dans le code) :
   Les variables déjà définies dans l'environnement priment sur le .env.
 
 Usage :
-    python garmin_history.py --start 2020-08-01
-    python garmin_history.py --start 2024-01-01 --end 2026-10-15
+    python history.py --start 2020-08-01
+    python history.py --start 2024-01-01 --end 2026-10-15
+    python history.py --start 2020-08-01 --all   # + pas, sommeil, prédictions
+
+Les indicateurs optionnels (pas, sommeil, prédictions de course) sont
+récupérés par tranches de dates (1 appel par 28 jours, ou par 365 jours pour
+les prédictions) et ne remplissent que les jours où la valeur manque.
 """
 import argparse
 import getpass
 import json
 import os
+import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -33,6 +40,8 @@ from pathlib import Path
 import pandas as pd
 from garminconnect import Garmin
 from tqdm.auto import tqdm
+
+from units import fmt_hm, fmt_hms
 
 try:
     from dotenv import load_dotenv
@@ -43,6 +52,12 @@ except ImportError:
 
 TOKEN_DIR = Path.home() / ".garmin_tokens"   # jetons de session (pas le mot de passe)
 CACHE_FILE = Path("garmin_daily_cache.json")  # données journalières déjà téléchargées
+VERBOSE = False   # journalise les erreurs d'appel API (--verbose)
+
+# l'API limite la taille des plages demandées : 28 jours pour les endpoints
+# « stats » (pas, sommeil), 365 jours pour les prédictions de course
+CHUNK_DAYS = 28
+RACE_CHUNK_DAYS = 365
 
 # ------------------------------------------------- synthèse de la semaine
 COLS_DAILY = ["rhr", "hr_max", "stress", "bb_max", "calories",
@@ -59,24 +74,26 @@ SENS = {"rhr": -1, "stress": -1, "bb_max": +1, "weight": -1, "VO2max": +1,
 MIN_CAL = 50   # calories actives min. pour considérer un jour « actif »
 # indicateur -> (libellé affiché, nombre de décimales, agrégation)
 #   "somme" : cumulé sur la semaine (activité, comme dans history.csv)
-#   "moyenne" : niveau moyen sur la semaine (santé)
+#   "moyenne" : niveau moyen sur la semaine (santé, pas)
 SPEC = {
     "moderate": ("Modérée (min)", 0, "somme"),
     "intense": ("Intense (min)", 0, "somme"),
     "total": ("Total pondéré (min)", 0, "somme"),
     "calories": ("Calories actives (kcal)", 0, "somme"),
-    "steps": ("Pas", 0, "somme"),
+    "steps": ("Pas (par jour)", 0, "moyenne"),
     "rhr": ("FC repos (bpm)", 0, "moyenne"),
     "hr_max": ("FC max (bpm)", 0, "moyenne"),
     "stress": ("Stress (pts)", 0, "moyenne"),
     "bb_max": ("Body Battery max (pts)", 0, "moyenne"),
     "VO2max": ("VO2max (ml/kg/min)", 1, "moyenne"),
     "sleep_score": ("Score sommeil", 0, "moyenne"),
-    "sleep_hours": ("Sommeil (h)", 2, "moyenne"),
+    "sleep_hours": ("Sommeil", 0, "moyenne"),
     "weight": ("Poids (kg)", 1, "moyenne"),
-    "pred_5k": ("Prédiction 5K (min)", 1, "moyenne"),
-    "pred_half": ("Prédiction semi (min)", 1, "moyenne"),
+    "pred_5k": ("Prédiction 5K", 0, "moyenne"),
+    "pred_half": ("Prédiction semi", 0, "moyenne"),
 }
+# indicateurs affichés sous forme de durée plutôt que de nombre
+FORMATS = {"sleep_hours": "hm", "pred_5k": "hms", "pred_half": "hms"}
 ORDRE = ["moderate", "intense", "total", "calories", "steps",
          "rhr", "hr_max", "stress", "bb_max", "VO2max", "sleep_score", "sleep_hours",
          "pred_5k", "pred_half", "weight"]
@@ -117,41 +134,164 @@ def login() -> Garmin:
 
 
 def safe(fn, *args):
+    """Appelle fn(*args) ; renvoie None si l'appel échoue.
+
+    Les erreurs sont silencieuses par défaut (le script ne doit pas s'arrêter
+    sur un jour manquant) mais journalisées avec --verbose.
+    """
     try:
         return fn(*args)
-    except Exception:
+    except Exception as e:
+        if VERBOSE:
+            name = getattr(fn, "__name__", str(fn))
+            print(f"  [api] {name} a échoué : {type(e).__name__}: {e}",
+                  file=sys.stderr)
         return None
 
 
-def fetch_day(api: Garmin, d: str, existing: dict | None = None,
-              with_steps: bool = False,
-              with_sleep: bool = False) -> dict:
+def _put(row: dict, key: str, value) -> None:
+    """Écrit une valeur seulement si elle est connue.
+
+    Un appel API qui échoue (réseau, 429, champ absent) renvoie None : on ne
+    doit alors pas écraser la valeur déjà présente dans le cache.
+    """
+    if value is not None:
+        row[key] = value
+
+
+def _rows(data) -> list:
+    """Normalise une réponse d'API en liste de lignes.
+
+    Selon l'endpoint, l'API renvoie soit une liste directe, soit un objet
+    contenant la liste sous une clé (« userPredictionVos », « individualStats »).
+    """
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("userPredictionVos", "individualStats", "rows"):
+            if isinstance(data.get(key), list):
+                return data[key]
+    return []
+
+
+def _chunks(start: date, end: date, days: int):
+    """Tranches [a, b] inclusives couvrant [start, end) (borne 'end' exclusive)."""
+    if end <= start:
+        return
+    last = end - timedelta(days=1)
+    a = start
+    while a <= last:
+        b = min(a + timedelta(days=days - 1), last)
+        yield a, b
+        a = b + timedelta(days=1)
+
+
+def _needed_chunks(start: date, end: date, days: int, missing: set[str]):
+    """Tranches contenant au moins un jour manquant (évite les appels inutiles)."""
+    for a, b in _chunks(start, end, days):
+        d = a
+        while d <= b:
+            if d.isoformat() in missing:
+                yield a, b
+                break
+            d += timedelta(days=1)
+
+
+def _parse_steps_rows(rows) -> dict[str, int]:
+    """Réponse « stats/pas » -> {date ISO: nombre de pas}."""
+    out: dict[str, int] = {}
+    for row in rows or []:
+        d = row.get("calendarDate")
+        n = row.get("totalSteps")
+        if d and n is not None:
+            out[d] = n
+    return out
+
+
+def _parse_sleep_rows(rows) -> dict[str, dict]:
+    """Réponse « sleep/daily » -> {date ISO: {"sleep_score":…, "sleep_hours":…}}."""
+    out: dict[str, dict] = {}
+    for row in rows or []:
+        d = row.get("calendarDate")
+        if not d:
+            continue
+        v = row.get("values") or {}
+        score = v.get("sleepScore")
+        dur = v.get("totalSleepTimeInSeconds")
+        out[d] = {
+            "sleep_score": score,
+            "sleep_hours": round(dur / 3600, 2) if dur else None,
+        }
+    return out
+
+
+def _parse_race_rows(rows) -> dict[str, dict]:
+    """Réponse « racepredictions » -> {date ISO: {"pred_5k":…, "pred_half":…}}.
+
+    L'API renvoie les temps en secondes (time5K, time10K, timeHalfMarathon,
+    timeMarathon) ; on ne garde que le 5K et le semi, convertis en minutes.
+    """
+    out: dict[str, dict] = {}
+    for row in rows or []:
+        d = row.get("calendarDate")
+        if not d:
+            continue
+        t5 = row.get("time5K")
+        th = row.get("timeHalfMarathon")
+        if t5 is None and th is None:
+            continue
+        out[d] = {
+            "pred_5k": round(t5 / 60, 1) if t5 else None,
+            "pred_half": round(th / 60, 1) if th else None,
+        }
+    return out
+
+
+def _merge(cache: dict, data: dict, cols) -> int:
+    """Écrit dans le cache les valeurs absentes uniquement.
+
+    Renvoie le nombre de valeurs écrites. Les jours absents du cache sont
+    ignorés, et une valeur déjà connue n'est jamais écrasée.
+    """
+    n = 0
+    for d, vals in data.items():
+        row = cache.get(d)
+        if row is None:
+            continue
+        # une valeur peut être un scalaire (nombre de pas) ou un dict
+        # (sommeil, prédictions de course)
+        items = vals.items() if isinstance(vals, dict) else [(cols[0], vals)]
+        for c, v in items:
+            if c not in cols or v is None:
+                continue
+            if row.get(c) is None:
+                row[c] = v
+                n += 1
+    return n
+
+
+def fetch_day(api: Garmin, d: str, existing: dict | None = None) -> dict:
+    """Récupère les indicateurs quotidiens d'une date.
+
+    `existing` (entrée du cache) sert de base : une valeur déjà connue n'est
+    jamais écrasée par None (un appel API qui échoue ne doit pas perdre une
+    donnée).
+    """
     s = safe(api.get_stats, d) or {}
-    # parte de l'entrée cache existante pour ne pas écraser un indicateur
-    # qu'on ne rafraîchit pas à cet appel (ex. pas déjà connus, sommeil non demandé)
     row = dict(existing) if existing else {}
-    row["rhr"] = s.get("restingHeartRate")
-    row["hr_max"] = s.get("maxHeartRate")
-    row["stress"] = s.get("averageStressLevel")
-    row["bb_max"] = s.get("bodyBatteryHighestValue")
-    row["calories"] = s.get("activeKilocalories")
-    row["moderate"] = s.get("moderateIntensityMinutes")
-    row["intense"] = s.get("vigorousIntensityMinutes")
-    if with_steps:
-        steps = safe(api.get_steps_data, d)
-        if steps and steps[0].get("totalSteps") is not None:
-            row["steps"] = steps[0].get("totalSteps")
-    if with_sleep:
-        sl = safe(api.get_sleep_data, d)
-        if sl:
-            row["sleep_score"] = sl.get("sleepScore")
-            dur = sl.get("durationInSeconds")
-            if dur:
-                row["sleep_hours"] = round(dur / 3600, 2)
+    _put(row, "rhr", s.get("restingHeartRate"))
+    _put(row, "hr_max", s.get("maxHeartRate"))
+    _put(row, "stress", s.get("averageStressLevel"))
+    _put(row, "bb_max", s.get("bodyBatteryHighestValue"))
+    _put(row, "calories", s.get("activeKilocalories"))
+    _put(row, "moderate", s.get("moderateIntensityMinutes"))
+    _put(row, "intense", s.get("vigorousIntensityMinutes"))
+    # les pas sont déjà dans la réponse « stats » : aucun appel supplémentaire
+    _put(row, "steps", s.get("totalSteps"))
     mm = safe(api.get_max_metrics, d)
     if mm:
         try:
-            row["VO2max"] = mm[0]["generic"]["vo2MaxPreciseValue"]
+            _put(row, "VO2max", mm[0]["generic"]["vo2MaxPreciseValue"])
         except (KeyError, IndexError, TypeError):
             pass  # garder la valeur en cache si l'appel échoue
     bc = safe(api.get_body_composition, d, d)
@@ -160,56 +300,40 @@ def fetch_day(api: Garmin, d: str, existing: dict | None = None,
     return row
 
 
-def _need_refresh(entry: dict | None, with_steps: bool, with_sleep: bool,
-                  with_races: bool) -> bool:
-    """Une journée déjà en cache doit être retéléchargée si un indicateur
-    demandé manque (ex. premier run sans --steps, puis run avec --steps)."""
-    if entry is None:
-        return True
-    if with_steps and entry.get("steps") is None:
-        return True
-    if with_sleep and (entry.get("sleep_score") is None or entry.get("sleep_hours") is None):
-        return True
-    if with_races and entry.get("pred_5k") is None and entry.get("pred_half") is None:
-        return True
-    return False
+def fetch_steps_range(api: Garmin, chunks) -> dict[str, int]:
+    """Nombre de pas quotidiens (1 appel API par tranche de 28 jours)."""
+    out: dict[str, int] = {}
+    for a, b in chunks:
+        data = safe(api.get_daily_steps, a.isoformat(), b.isoformat())
+        out.update(_parse_steps_rows(_rows(data)))
+    return out
 
 
-def fetch_race_predictions(api: Garmin, start: date, end: date) -> dict[str, dict]:
-    """Récupère les prédictions de course (5K, semi) pour toute la plage.
+def fetch_sleep_range(api: Garmin, chunks) -> dict[str, dict]:
+    """Score et durée du sommeil (1 appel API par tranche de 28 jours)."""
+    out: dict[str, dict] = {}
+    for a, b in chunks:
+        data = safe(api.get_sleep_daily, a.isoformat(), b.isoformat())
+        out.update(_parse_sleep_rows(_rows(data)))
+    return out
 
-    L'API Garmin accepte une plage de dates (max 366 jours) avec _type="daily".
-    Retourne un dictionnaire {date ISO: {"pred_5k": minutes, "pred_half": minutes}}.
+
+def fetch_race_predictions(api: Garmin, chunks) -> dict[str, dict]:
+    """Prédictions de course 5K / semi (1 appel API par tranche de 365 jours)."""
+    out: dict[str, dict] = {}
+    for a, b in chunks:
+        data = safe(api.get_race_predictions, a.isoformat(), b.isoformat(), "daily")
+        out.update(_parse_race_rows(_rows(data)))
+    return out
+
+
+def _need_refresh(entry: dict | None) -> bool:
+    """Une journée absente du cache doit être téléchargée.
+
+    Les indicateurs optionnels (pas, sommeil, prédictions) ne passent pas par
+    là : ils sont récupérés par tranches, hors de la boucle journalière.
     """
-    predictions: dict[str, dict] = {}
-    chunk_start = start
-    while chunk_start < end:
-        chunk_end = min(chunk_start + timedelta(days=366), end)
-        data = safe(api.get_race_predictions, chunk_start.isoformat(),
-                    chunk_end.isoformat(), "daily")
-        chunk_start = chunk_end
-        if not data:
-            continue
-        # l'API peut renvoyer une liste directe ou un dict avec "userPredictionVos"
-        entries = data if isinstance(data, list) else data.get("userPredictionVos", [])
-        for entry in entries:
-            cal_date = entry.get("calendarDate")
-            if not cal_date:
-                continue
-            secs: dict[str, float | None] = {"5k": None, "half marathon": None}
-            for dist in entry.get("raceDistances", []):
-                name = dist.get("distance")
-                t = dist.get("predictedTime")
-                if name in secs and t is not None:
-                    secs[name] = float(t)
-            if secs["5k"] is None and secs["half marathon"] is None:
-                continue
-            predictions[cal_date] = {
-                "pred_5k": round(secs["5k"] / 60, 1) if secs["5k"] is not None else None,
-                "pred_half": round(secs["half marathon"] / 60, 1)
-                if secs["half marathon"] is not None else None,
-            }
-    return predictions
+    return entry is None
 
 
 def download(api: Garmin, start: date, end: date, with_steps: bool = False,
@@ -224,12 +348,9 @@ def download(api: Garmin, start: date, end: date, with_steps: bool = False,
         while d < end:
             key = d.isoformat()
             # on retélécharge toujours les 3 derniers jours (données incomplètes)
-            # et toute journée manquante un indicateur demandé (pas, sommeil, courses)
-            if (_need_refresh(cache.get(key), with_steps, with_sleep, with_races)
-                    or d >= end - timedelta(days=3)):
-                cache[key] = fetch_day(api, key, existing=cache.get(key),
-                                       with_steps=with_steps,
-                                       with_sleep=with_sleep)
+            # et les journées absentes du cache
+            if _need_refresh(cache.get(key)) or d >= end - timedelta(days=3):
+                cache[key] = fetch_day(api, key, existing=cache.get(key))
                 n += 1
                 bar.set_postfix_str(f"{n} téléchargés")
                 if n % 25 == 0:
@@ -238,19 +359,31 @@ def download(api: Garmin, start: date, end: date, with_steps: bool = False,
             d += timedelta(days=1)
             bar.update(1)
 
-    # Prédictions de course : un seul appel par tranche d'année, fusionné dans le cache.
-    # On ne appelle l'API que si au moins une journée de la plage manque les prédictions.
-    if with_races:
-        missing = [d.isoformat() for d in _daterange(start, end)
-                   if cache.get(d.isoformat(), {}).get("pred_5k") is None
-                   and cache.get(d.isoformat(), {}).get("pred_half") is None]
-        if missing:
-            bar.set_postfix_str("prédictions de course")
-            for cal_date, preds in fetch_race_predictions(api, start, end).items():
-                if cal_date in cache:
-                    cache[cal_date].update(preds)
-                else:
-                    cache[cal_date] = preds
+        # Indicateurs optionnels : récupérés par tranches de dates (1 appel par
+        # 28 jours pour les pas et le sommeil, 1 par 365 jours pour les
+        # prédictions de course) et fusionnés dans le cache. Seules les
+        # tranches incomplètes sont interrogées, et une valeur déjà connue
+        # n'est jamais écrasée.
+        for flag, label, days, fetcher, cols, is_missing in (
+            (with_steps, "pas", CHUNK_DAYS, fetch_steps_range, ("steps",),
+             lambda e: e.get("steps") is None),
+            (with_sleep, "sommeil", CHUNK_DAYS, fetch_sleep_range,
+             ("sleep_score", "sleep_hours"),
+             lambda e: e.get("sleep_score") is None or e.get("sleep_hours") is None),
+            (with_races, "prédictions de course", RACE_CHUNK_DAYS,
+             fetch_race_predictions, ("pred_5k", "pred_half"),
+             lambda e: e.get("pred_5k") is None and e.get("pred_half") is None),
+        ):
+            if not flag:
+                continue
+            missing = {d.isoformat() for d in _daterange(start, end)
+                       if is_missing(cache.get(d.isoformat(), {}))}
+            if not missing:
+                continue
+            bar.set_postfix_str(label)
+            data = fetcher(api, _needed_chunks(start, end, days, missing))
+            written = _merge(cache, data, cols)
+            bar.set_postfix_str(f"{label} : {written} jour(s)")
             CACHE_FILE.write_text(json.dumps(cache))
 
     CACHE_FILE.write_text(json.dumps(cache))
@@ -268,7 +401,8 @@ def _daterange(start: date, end: date):
 def monthly(cache: dict) -> pd.DataFrame:
     df = pd.DataFrame.from_dict(cache, orient="index")
     df.index = pd.to_datetime(df.index)
-    df = df.apply(pd.to_numeric, errors="coerce")
+    # colonnes fixes : un indicateur absent du cache devient NaN (jamais une erreur)
+    df = df.reindex(columns=COLS_DAILY).apply(pd.to_numeric, errors="coerce")
     g = df.groupby(df.index.to_period("M"))
     out = pd.DataFrame({
         "days": g.size(),
@@ -279,10 +413,13 @@ def monthly(cache: dict) -> pd.DataFrame:
         "VO2max": g["VO2max"].mean(),
         "max_VO2max": g["VO2max"].max(),
         "stress": g["stress"].mean(),
-        "calories": g["calories"].sum(),
-        "steps": g["steps"].sum(),
-        "moderate": g["moderate"].sum(),
-        "intense": g["intense"].sum(),
+        # min_count=1 : un mois sans aucune mesure vaut NaN (et non 0),
+        # pour ne pas confondre « aucun relevé » et « valeur nulle »
+        "calories": g["calories"].sum(min_count=1),
+        # les pas sont ramenés au jour : la moyenne du mois (pas/j)
+        "steps": g["steps"].mean(),
+        "moderate": g["moderate"].sum(min_count=1),
+        "intense": g["intense"].sum(min_count=1),
         "sleep_score": g["sleep_score"].mean(),
         "sleep_hours": g["sleep_hours"].mean(),
         "pred_5k": g["pred_5k"].mean(),
@@ -291,7 +428,32 @@ def monthly(cache: dict) -> pd.DataFrame:
     out["total"] = out["moderate"] + 2 * out["intense"]
     out.index = out.index.astype(str)
     out.index.name = "month"
-    return out.round(1).reset_index()
+    out = out.reset_index()
+    # arrondi à 1 décimale, sauf les durées (sommeil, prédictions) qui
+    # gardent leur précision pour l'affichage « hh:mm » / « hh:mm:ss », et
+    # les pas, déjà exprimés par jour
+    dur = ["sleep_hours", "pred_5k", "pred_half"]
+    num = [c for c in out.columns if c not in dur and c != "steps"]
+    out[num] = out[num].round(1)
+    return out
+
+
+def display_table(table: pd.DataFrame) -> pd.DataFrame:
+    """Version « lisible » du tableau mensuel (ce qui est écrit sur disque).
+
+    - les pas sont des pas/j (nombre entier) ;
+    - le sommeil est formaté « hh:mm » ;
+    - les prédictions de course sont formatées « hh:mm:ss ».
+    """
+    out = table.copy()
+    if "steps" in out.columns:
+        out["steps"] = out["steps"].round(0).astype("Int64")
+    if "sleep_hours" in out.columns:
+        out["sleep_hours"] = out["sleep_hours"].map(fmt_hm)
+    for c in ("pred_5k", "pred_half"):
+        if c in out.columns:
+            out[c] = out[c].map(fmt_hms)
+    return out
 
 
 # ------------------------------------------------------ synthèse hebdomadaire
@@ -344,6 +506,40 @@ def _mesures(n: int) -> str:
     return f"{n} mesure" if n <= 1 else f"{n} mesures"
 
 
+def _fmt(v, dec: int, fmt: str | None = None) -> str:
+    """Formate une valeur selon l'unité de l'indicateur.
+
+    fmt = "hm"  -> durée « hh:mm » (sommeil)
+    fmt = "hms" -> durée « hh:mm:ss » (prédictions de course)
+    sinon        -> nombre à `dec` décimales
+    """
+    if fmt == "hm":
+        return fmt_hm(v) or "-"
+    if fmt == "hms":
+        return fmt_hms(v) or "-"
+    return _num(v, dec)
+
+
+def _fmt_ecart(v, dec: int, fmt: str | None = None) -> str:
+    """Écart signé entre la semaine et la référence."""
+    if pd.isna(v):
+        return "-"
+    if fmt == "hm":
+        return fmt_hm(v, signed=True)
+    if fmt == "hms":
+        return fmt_hms(v, signed=True)
+    return ("+" if v >= 0 else "") + _num(v, dec)
+
+
+def _ecart_affiche(d, dec: int, fmt: str | None = None) -> float:
+    """Écart ramené à l'unité d'affichage (pour judge du sens)."""
+    if pd.isna(d):
+        return float("nan")
+    if fmt in ("hm", "hms"):
+        return round(d * 60)
+    return round(d, dec)
+
+
 def synthese_semaine(cache: dict, jours: int = 7, semaines_ref: int = 12) -> str:
     """Synthèse des `jours` derniers jours, comparés aux `semaines_ref` semaines
     précédentes. Retourne un texte (affiché par `main`, testable sans Garmin)."""
@@ -377,14 +573,16 @@ def synthese_semaine(cache: dict, jours: int = 7, semaines_ref: int = 12) -> str
              f" | semi : {_mesures(int(week['pred_half'].notna().sum()))}")
 
     L.append("")
-    L.append("  ACTIVITÉ : cumul de la semaine | SANTÉ : moyenne de la semaine")
-    L.append(f"  {'INDICATEUR':<26s}{'SEMAINE':>10s}{'RÉFÉRENCE':>10s}"
-             f"{'ÉCART':>9s}   SENS")
+    L.append("  ACTIVITÉ : cumul de la semaine (pas : moyenne/jour) | "
+             "SANTÉ : moyenne de la semaine")
+    L.append(f"  {'INDICATEUR':<26s}{'SEMAINE':>11s}{'RÉFÉRENCE':>11s}"
+             f"{'ÉCART':>11s}   SENS")
     fav = unfav = n_stable = hors = 0
     non_comparables = []
     wvs, refs = {}, {}
     for c in ORDRE:
         lab, dec, mode = SPEC[c]
+        fmt = FORMATS.get(c)
         wv = _agg(week[c], mode)
         nw = int(week[c].notna().sum())
         nr = int(ref[c].notna().sum())
@@ -393,7 +591,7 @@ def synthese_semaine(cache: dict, jours: int = 7, semaines_ref: int = 12) -> str
         bv = [v for v in bv if not pd.isna(v)]
         rv = sum(bv) / len(bv) if bv else float("nan")
         d = wv - rv
-        d_r = round(d, dec) if not pd.isna(d) else float("nan")
+        d_r = _ecart_affiche(d, dec, fmt)
         if d_r == 0:
             d_r = 0.0   # normalise -0.0 (sinon on afficherait « +-0 »)
         # comparable : assez de mesures des deux côtés
@@ -416,8 +614,8 @@ def synthese_semaine(cache: dict, jours: int = 7, semaines_ref: int = 12) -> str
         if c in SENS and not comparable:
             non_comparables.append(f"{lab.split(' (')[0]} ({_mesures(nw)})")
         wvs[c], refs[c] = wv, rv
-        L.append(f"  {lab:<26s}{_num(wv, dec):>10s}{_num(rv, dec):>10s}"
-                 f"{('+' if d_r >= 0 else '') + _num(d_r, dec):>9s}   {sens}")
+        L.append(f"  {lab:<26s}{_fmt(wv, dec, fmt):>11s}{_fmt(rv, dec, fmt):>11s}"
+                 f"{_fmt_ecart(d, dec, fmt):>11s}   {sens}")
 
     if non_comparables and n_blocs:
         L.append("")
@@ -447,25 +645,35 @@ def synthese_semaine(cache: dict, jours: int = 7, semaines_ref: int = 12) -> str
 
 
 def main():
+    global VERBOSE
     p = argparse.ArgumentParser()
     p.add_argument("--start", default="2020-08-01")
     p.add_argument("--end", default=date.today().isoformat())
     p.add_argument("--steps", action="store_true",
-                   help="récupère aussi le nombre de pas quotidiens (2 appels API/jour supplémentaires)")
+                   help="récupère aussi le nombre de pas quotidiens "
+                        "(1 appel API par tranche de 28 jours)")
     p.add_argument("--sleep", action="store_true",
-                   help="récupère aussi le score et la durée du sommeil (2 appels API/jour supplémentaires)")
+                   help="récupère aussi le score et la durée du sommeil "
+                        "(1 appel API par tranche de 28 jours)")
     p.add_argument("--races", action="store_true",
                    help="récupère aussi les prédictions de course (5K, semi-marathon) "
                         "(1 appel API par tranche d'année)")
+    p.add_argument("--all", action="store_true",
+                   help="récupère tous les indicateurs optionnels (pas, sommeil, courses)")
+    p.add_argument("--verbose", action="store_true",
+                   help="journalise les erreurs d'appel API")
     a = p.parse_args()
     start = datetime.strptime(a.start, "%Y-%m-%d").date()
     end = datetime.strptime(a.end, "%Y-%m-%d").date()
+    VERBOSE = a.verbose
 
     api = login()
     print("Connecté. Téléchargement (long la première fois, ensuite en cache)...")
-    cache = download(api, start, end, with_steps=a.steps, with_sleep=a.sleep,
-                     with_races=a.races)
-    table = monthly(cache)
+    cache = download(api, start, end,
+                     with_steps=a.steps or a.all,
+                     with_sleep=a.sleep or a.all,
+                     with_races=a.races or a.all)
+    table = display_table(monthly(cache))
     table.to_csv("history.csv", index=False)
     table.to_excel("activity.xlsx", index=False)
     print(table.tail(6).to_string(index=False))

@@ -12,8 +12,9 @@ __pycache__/
 plan_habitudes.numbers
 
 # smoke test (CI) : données synthétiques et sorties d'analyse
-fixtures/
+fixtures*/
 out/
+out-partial/
 
 # fichiers de sauvegarde/pointe contenant les données Garmin réelles
 *.ckp

@@ -26,10 +26,13 @@ jobs:
         run: uv sync --frozen
 
       - name: Check that the scripts compile
-        run: uv run python -m compileall -q history.py analysis.py analysis_fine.py tests/make_fixtures.py
+        run: uv run python -m compileall -q history.py analysis.py analysis_fine.py units.py tests/make_fixtures.py tests/test_parsers.py
 
       - name: Check that the scripts import
-        run: uv run python -c "import history, analysis, analysis_fine"
+        run: uv run python -c "import history, analysis, analysis_fine, units"
+
+      - name: Run the unit tests
+        run: uv run python -m unittest discover -s tests -v
 
       - name: Generate synthetic fixtures
         run: uv run python tests/make_fixtures.py --out fixtures
@@ -57,5 +60,32 @@ jobs:
                    correlations_fine.csv correlations_weekly.png \
                    correlations_daily.png seasonality.png raw_vs_adjusted.png; do
             test -s "out/$f" || { echo "::error::out/$f manquant ou vide"; exit 1; }
+          done
+          echo "Tous les fichiers de sortie sont présents."
+
+      # un cache sans les indicateurs optionnels (pas, sommeil, prédictions)
+      # ne doit faire échouer aucun script
+      - name: Generate partial fixtures
+        run: uv run python tests/make_fixtures.py --out fixtures-partial --partial
+
+      - name: Smoke-test the scripts on a partial cache
+        run: |
+          uv run python -c "
+          import json
+          from history import display_table, monthly, synthese_semaine
+          cache = json.load(open('fixtures-partial/garmin_daily_cache.json'))
+          table = display_table(monthly(cache))
+          assert 'pred_5k' in table.columns, list(table.columns)
+          print(synthese_semaine(cache))
+          "
+          uv run python analysis.py --csv fixtures-partial/history.csv --out out-partial
+          uv run python analysis_fine.py --cache fixtures-partial/garmin_daily_cache.json --out out-partial --shifts 20 --boot 20
+
+      - name: Check the outputs of the partial run
+        run: |
+          for f in correlations.csv correlations.png \
+                   correlations_fine.csv correlations_weekly.png \
+                   correlations_daily.png seasonality.png raw_vs_adjusted.png; do
+            test -s "out-partial/$f" || { echo "::error::out-partial/$f manquant ou vide"; exit 1; }
           done
           echo "Tous les fichiers de sortie sont présents."
