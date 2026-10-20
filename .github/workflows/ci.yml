@@ -25,6 +25,21 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
+      - name: Check that the lock file is up to date
+        run: uv lock --check
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Check the formatting (ruff)
+        run: uv run ruff format --check .
+
+      - name: Type check (mypy)
+        run: uv run mypy
+
+      - name: Type check (ty)
+        run: uv run ty check .
+
       - name: Check that the scripts compile
         run: uv run python -m compileall -q history.py analysis.py analysis_fine.py units.py tests/make_fixtures.py tests/test_parsers.py
 
