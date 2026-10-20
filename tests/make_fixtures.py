@@ -74,12 +74,20 @@ def daily_cache(start: date, days: int, seed: int = 0) -> dict:
             steps = 0
             sleep_score = None
             sleep_hours = None
+            pred_5k = None
+            pred_half = None
         else:
             # pas : plus le week-end
             steps = round(6500 + 2500 * season + 1800 * weekend + rng.gauss(0, 900))
             # sommeil : 6-8h, score 55-90, un peu mieux le week-end
             sleep_hours = round(7.0 + 0.3 * season + 0.4 * weekend + rng.gauss(0, 0.6), 2)
             sleep_score = round(65 + 10 * season + 5 * weekend + rng.gauss(0, 8))
+            # prédictions de course (en minutes), fonction du VO2max et de la saison
+            # 5K : ~20-26 min, semi : ~105-125 min, meilleur en été
+            base_5k = 24 - 0.5 * (vo2max - 47) - 1.5 * season
+            base_half = 118 - 2.5 * (vo2max - 47) - 8 * season
+            pred_5k = round(max(15.0, base_5k + rng.gauss(0, 0.8)), 1)
+            pred_half = round(max(80.0, base_half + rng.gauss(0, 4)), 1)
 
         row = {
             "rhr": round(rhr, 0),
@@ -93,6 +101,8 @@ def daily_cache(start: date, days: int, seed: int = 0) -> dict:
             "steps": steps,
             "sleep_score": sleep_score,
             "sleep_hours": sleep_hours,
+            "pred_5k": pred_5k,
+            "pred_half": pred_half,
             # la balance n'est pas utilisée tous les jours
             "weight": round(weight, 3) if (d.weekday() in (0, 2, 4) or rng.random() < 0.1) else None,
         }

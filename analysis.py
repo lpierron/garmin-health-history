@@ -44,10 +44,13 @@ HEALTH = {
     "bb_max": "Body Battery max",
     "sleep_score": "Score sommeil",
     "sleep_hours": "Sommeil (h)",
+    "pred_5k": "Prédiction 5K",
+    "pred_half": "Prédiction semi-marathon",
 }
 # sens "favorable" (+1 : plus haut = mieux, -1 : plus bas = mieux)
 GOOD_DIRECTION = {"rhr": -1, "VO2max": +1, "weight": -1, "stress": -1, "bb_max": +1,
-                  "sleep_score": +1, "sleep_hours": +1}
+                  "sleep_score": +1, "sleep_hours": +1,
+                  "pred_5k": -1, "pred_half": -1}
 MIN_PAIRS = 12  # en dessous, une corrélation n'a pas de sens
 
 
