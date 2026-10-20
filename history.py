@@ -190,7 +190,9 @@ def fetch_race_predictions(api: Garmin, start: date, end: date) -> dict[str, dic
         chunk_start = chunk_end
         if not data:
             continue
-        for entry in data.get("userPredictionVos", []):
+        # l'API peut renvoyer une liste directe ou un dict avec "userPredictionVos"
+        entries = data if isinstance(data, list) else data.get("userPredictionVos", [])
+        for entry in entries:
             cal_date = entry.get("calendarDate")
             if not cal_date:
                 continue
